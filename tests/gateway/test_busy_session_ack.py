@@ -183,6 +183,8 @@ class TestBusySessionAck:
             content = str(call_kwargs)
         assert "Interrupting" in content or "respond" in content
         assert "/stop" not in content  # no need — we ARE interrupting
+        # An automatic acknowledgment is explicitly silent (Telegram disable_notification).
+        assert call_kwargs.kwargs["metadata"]["notify"] is False
 
         # Verify agent interrupt was called
         agent.interrupt.assert_called_once_with("Are you working?")
@@ -510,6 +512,8 @@ class TestLongRunningNotificationOwnership:
 
         assert first_send.await_count == 1  # the original heartbeat only
         adapter.edit_message.assert_awaited_once()
+        # The "still working" heartbeat is an automatic status: explicitly silent.
+        assert first_send.await_args.kwargs["metadata"]["notify"] is False
 
     @pytest.mark.parametrize("flag", ["_draining", "_restart_requested"])
     def test_notification_stops_once_shutdown_or_restart_begins(self, flag):
