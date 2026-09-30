@@ -365,11 +365,64 @@ def _rich_send_result(rich, chat_id, outcome) -> dict:
     return outcome.failure(_error(f"Telegram send failed: {rich.error}"), never_sent=never_sent)
 
 
+async def _edit_telegram(token, chat_id, message_id, message, disable_link_previews=False, extra=None):
+    """Replace the text of a message this bot sent (Bot API ``editMessageText``). One message only: no media, no
+    chunking (over 4096 UTF-16 units is an error, so the caller can send a fresh message instead). An edit never
+    notifies. "Message is not modified" counts as success. Parse failures fall back to plain text."""
+    try:
+        from gateway.platforms.base import utf16_len
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        formatted, parse_mode, has_html = _telegram_format(message)
+        if not formatted.strip():
+            return _error("Telegram edit needs text")
+        if utf16_len(formatted) > 4096:
+            return _error("Telegram edit too long for one message (4096 UTF-16 units); send a new message instead")
+        bot = _telegram_bot(token, extra)
+        kwargs = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id),
+                  **({"disable_web_page_preview": True} if disable_link_previews else {})}
+        try:
+            try:
+                await bot.edit_message_text(text=formatted, parse_mode=parse_mode, **kwargs)
+            except Exception as md_error:
+                err_text = str(md_error).lower()
+                if "not modified" in err_text:
+                    raise
+                if "parse" in err_text or "markdown" in err_text or "html" in err_text:
+                    await bot.edit_message_text(text=formatted if has_html else _strip_mdv2_safe(formatted),
+                                                parse_mode=None, **kwargs)
+                else:
+                    raise
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+        return _success(chat_id, message_id=str(message_id), edited=True)
+    except ImportError:
+        return {"error": "python-telegram-bot not installed. Run: "
+                f"{install_hint('telegram')}"}
+    except Exception as e:
+        return _error(f"Telegram edit failed: {e}")
+
+
+def _telegram_reply_kwargs(reply_to):
+    """Reply to ``reply_to`` (a message id in the same chat), and still deliver if that message is gone."""
+    if reply_to is None:
+        return {}
+    try:
+        from telegram import ReplyParameters
+        return {"reply_parameters": ReplyParameters(message_id=int(reply_to), allow_sending_without_reply=True)}
+    except ImportError:  # older python-telegram-bot
+        return {"reply_to_message_id": int(reply_to), "allow_sending_without_reply": True}
+
+
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False,
-                         force_document=False, extra=None, notify=None):
+                         force_document=False, extra=None, notify=None, reply_to=None, preview_url=None):
     """One-shot Telegram Bot API send over the platform's ``extra`` (base_url, proxy, fallback IPs,
     ``rich_messages``), under the adapter's push-notification mode (``notify`` rings regardless);
-    parse failures fall back to plain text."""
+    parse failures fall back to plain text.
+    ``reply_to``: the first text chunk (or the first upload, when there is no text) replies to that message id,
+    with ``allow_sending_without_reply`` so a deleted original never costs the delivery.
+    ``preview_url``: the link whose card to show (``link_preview_options.url``), when the first link should not
+    have it. Either one skips the opt-in rich path, which carries neither."""
     if str(thread_id or "").strip() and not str(thread_id).strip().lstrip("-").isdigit():
         # ``<chat>:<topic name>`` parses for every caller, but only the live gateway's cron router
         # resolves a name (ensure_dm_topic): the Bot API has no topic lookup by name (#80483).
@@ -398,8 +451,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                          **notification_kwargs(resolve_notifications_mode(), notify)}
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
+        if preview_url and not disable_link_previews:
+            try:
+                from telegram import LinkPreviewOptions
+                text_kwargs["link_preview_options"] = LinkPreviewOptions(url=preview_url)
+            except ImportError:
+                pass
         warnings, _tg_caption = [], None
-        if message and not media_files:
+        reply_kwargs = _telegram_reply_kwargs(reply_to)  # consumed by the first message actually sent
+        if message and not media_files and not reply_kwargs and not preview_url:
             rich = await send_rich_standalone(bot, {**(extra or {}), "disable_link_previews": disable_link_previews},
                                               chat_id, message, thread_id=thread_id, notify=notify)
             if rich is not None:
@@ -420,10 +480,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             from plugins.platforms.telegram.telegram_chunking import split_formatted_mdv2
             chunks = split_formatted_mdv2(formatted, 4096, BasePlatformAdapter.truncate_message, utf16_len)
         for chunk in chunks:
+            kw = {**text_kwargs, **reply_kwargs} if reply_kwargs else text_kwargs
             last_msg = await _telegram_send_text_chunk(
-                bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs, outcome=outcome)
+                bot, int_chat_id, chunk, send_parse_mode, _has_html, kw, outcome=outcome)
+            if kw is not text_kwargs and "message_thread_id" not in kw:
+                text_kwargs.pop("message_thread_id", None)  # thread-not-found fallback carries to later chunks
+            reply_kwargs = {}
             outcome.landed(getattr(last_msg, "message_id", None))
-        if album := _telegram_album_paths(media_files, force_document, _tg_caption):
+        # A reply still owed goes on the first upload, so an album (which cannot carry it) goes file by file.
+        if not reply_kwargs and (album := _telegram_album_paths(media_files, force_document, _tg_caption)):
             result = await send_album_standalone(bot, extra or {}, chat_id, album, thread_id=thread_id, notify=notify)
             detail = result.raw_response or {}
             warnings += [_sanitize_error_text(f"Failed to send Telegram photo {path}: {err}")
@@ -444,8 +509,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 if _tg_caption is not None and last_msg is None:
                     try:
                         last_msg = await _send_telegram_message_with_retry(
-                            bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode, **text_kwargs)
-                        _tg_caption = None  # delivered — don't re-caption a later file
+                            bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode,
+                            **text_kwargs, **reply_kwargs)
+                        _tg_caption, reply_kwargs = None, {}  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning("Telegram caption-fallback send failed for missing media: %s",
                                        _sanitize_error_text(_cap_err))
@@ -453,7 +519,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 last_msg = await _telegram_send_one_media(
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
-                    has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
+                    has_html=_has_html, thread_kwargs={**thread_kwargs, **reply_kwargs}, force_document=force_document)
+                reply_kwargs = {}
             except Exception as e:
                 last_msg = _record_media_failure(e, media_path, warnings, last_msg)
         if last_msg is None:
@@ -474,18 +541,38 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
 
 async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
-                          notify=None, **_ignored):
+                          notify=None, reply_to=None, link_preview=None, **_ignored):
     """``standalone_sender_fn``: the target profile's token (``pconfig.token``, else its scoped
     ``TELEGRAM_BOT_TOKEN``) and ``extra`` (base_url, proxy, fallback IPs, rich_messages, link
-    previews); ``notify`` rings under the ``important`` notification mode (cron.delivery.notify)."""
+    previews); ``notify`` rings under the ``important`` notification mode (cron.delivery.notify), an
+    explicit ``False`` is silent in every mode; ``reply_to`` replies to that message id; ``link_preview``
+    (True/False) overrides the configured preview choice for this one message."""
+    from plugins.platforms.telegram.link_previews import preview_for
+    token = _standalone_token(pconfig)
+    extra = getattr(pconfig, "extra", None) or {}
+    disable_link_previews, preview_url = preview_for(extra, message, link_preview)
+    if link_preview is not None:   # the per-message choice beats skip hosts on every path
+        extra = {**extra, "link_preview_skip_hosts": ()}
+    result = await _send_telegram(
+        token, chat_id, message, media_files=media_files, thread_id=thread_id,
+        disable_link_previews=disable_link_previews, force_document=force_document,
+        extra=extra, notify=notify, reply_to=reply_to, preview_url=preview_url)
+    from plugins.platforms.telegram.telegram_send_errors import explain_username_chat_not_found
+    return explain_username_chat_not_found(result, chat_id)
+
+
+def _standalone_token(pconfig):
     token = getattr(pconfig, "token", None)
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
         token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
+    return token
+
+
+async def standalone_edit(pconfig, chat_id, message_id, message, *, link_preview=None):
+    """``hermes send --edit``: replace a sent message's text with the target profile's token and ``extra``; the
+    preview is re-decided for the new text (``link_previews.preview_for``)."""
+    from plugins.platforms.telegram.link_previews import preview_for
     extra = getattr(pconfig, "extra", None) or {}
-    result = await _send_telegram(
-        token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=bool(extra.get("disable_link_previews")), force_document=force_document,
-        extra=extra, notify=notify)
-    from plugins.platforms.telegram.telegram_send_errors import explain_username_chat_not_found
-    return explain_username_chat_not_found(result, chat_id)
+    return await _edit_telegram(_standalone_token(pconfig), chat_id, message_id, message,
+                                disable_link_previews=preview_for(extra, message, link_preview)[0], extra=extra)

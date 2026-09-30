@@ -198,6 +198,7 @@ from plugins.platforms.telegram.telegram_media_retry import unconfirmed_media_re
 from plugins.platforms.telegram import telegram_flood_window as _flood_window
 from plugins.platforms.telegram.telegram_media_fetch import (
     cache_replied_media, fetch_telegram_file, local_root, merged_typed_text, record_typed_text)
+from plugins.platforms.telegram.link_previews import link_preview_choice, parse_skip_hosts
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, tap_matches_prompt
@@ -490,6 +491,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._anchor_multipart_replies: bool = self._coerce_bool_extra("anchor_multipart_replies", True)  # #55059
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        # Hosts whose links never earn a preview card (e.g. a dashboard behind a sign-in page); see link_previews.
+        self._link_preview_skip_hosts = parse_skip_hosts(
+            self.config.extra.get("link_preview_skip_hosts") if getattr(self.config, "extra", None) else None)
         # Bot API 10.1 Rich Messages render what MarkdownV2 degrades (tables, task lists, <details>, block
         # math). Opt-in: current clients make rich messages hard to copy as plain text. rich_drafts is a
         # separate opt-in (Desktop can leave rich draft frames overlaid): off keeps native draft transport
@@ -1140,12 +1144,24 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             return default
         return bool(value)
 
-    def _link_preview_kwargs(self) -> dict[str, Any]:
-        if not getattr(self, "_disable_link_previews", False):
+    def _link_preview_kwargs(self, metadata: Optional[dict[str, Any]] = None, text: Optional[str] = None) -> dict[str, Any]:
+        """Link-preview kwargs, first match wins: ``metadata["link_preview"]`` (False: none for this message;
+        True: Telegram's default) > ``disable_link_previews`` > ``link_preview_skip_hosts`` applied to ``text``
+        (no card when every link is to a skipped host; the first other link's card when one is)."""
+        override = (metadata or {}).get("link_preview")
+        if isinstance(override, bool):
+            choice = None if override else False
+        elif getattr(self, "_disable_link_previews", False):
+            choice = False
+        else:
+            choice = link_preview_choice(text, getattr(self, "_link_preview_skip_hosts", ()))
+        if choice is None:
             return {}
-        if LinkPreviewOptions is not None:
-            return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-        return {"disable_web_page_preview": True}
+        if choice is False:
+            if LinkPreviewOptions is not None:
+                return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+            return {"disable_web_page_preview": True}
+        return {"link_preview_options": LinkPreviewOptions(url=choice)} if LinkPreviewOptions is not None else {}
 
     # --- Bot API 10.1 Rich Messages (sendRichMessage): final/new-message replies opportunistically send
     # RAW agent markdown so tables, task lists, <details>, math render natively; legacy MarkdownV2 send()
@@ -1396,6 +1412,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
+        else:
+            choice = link_preview_choice(content, getattr(self, "_link_preview_skip_hosts", ()))
+            if choice is not None:
+                payload["link_preview_options"] = {"is_disabled": True} if choice is False else {"url": choice}
         return payload
 
     def _rich_rejected(self, exc: Exception, what: str, fallback: str) -> bool:
@@ -3244,7 +3264,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             try:
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
-                    **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
+                    **self._link_preview_kwargs(metadata, chunk), **self._notification_kwargs(metadata)}
                 return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
@@ -3500,8 +3520,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         return await send_or_update_status(self, chat_id, status_key, content, metadata=metadata)
 
     async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
-        """``editMessageText`` (normalized ids, ``disable_link_previews`` honoured); ``parse_mode=None`` = plain."""
-        kwargs: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text, **self._link_preview_kwargs()}
+        """``editMessageText`` with normalized ids; ``parse_mode=None`` sends plain text."""
+        kwargs: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text,
+                                  **self._link_preview_kwargs(None, text)}   # an edit re-decides the card
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
         await _await_with_thread_deadline(
@@ -3673,7 +3694,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message, the flood-cap result on
         a flood refusal, or None."""
-        base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
+        base = {**self._link_preview_kwargs(metadata, chunk), **self._notification_kwargs(metadata)}
         for use_markdown in (True, False) if finalize else (False,):
             try:
                 if use_markdown:
@@ -6609,7 +6630,8 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     _bridge_gate(
         "group_allowed_chats", "TELEGRAM_GROUP_ALLOWED_CHATS",
         telegram_cfg.get("group_allowed_chats") or _telegram_extra.get("group_allowed_chats"))
-    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
+    for _key in ("guest_mode", "disable_link_previews", "link_preview_skip_hosts", "observe_unmentioned_group_messages",
+                 "free_response_topics"):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])
     # Pass through telegram-specific extra keys but EXCLUDE generic shared-config keys: _merge_platform_map
