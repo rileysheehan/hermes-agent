@@ -889,8 +889,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._schedule_held_inbound_redispatch()
 
     def _notification_kwargs(self, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """In "important" mode return disable_notification=True unless ``notify`` or ``is_approval_prompt`` (#132516)."""
-        if getattr(self, "_notifications_mode", "important") != "important" or (metadata or {}).get("notify") \
+        """In "important" mode return disable_notification=True unless ``metadata["notify"]`` or
+        ``is_approval_prompt`` (#132516). An explicit ``metadata["notify"] is False`` is silent in every mode (a
+        caller's per-message choice beats the default)."""
+        notify = (metadata or {}).get("notify")
+        if notify is False:
+            return {"disable_notification": True}
+        if getattr(self, "_notifications_mode", "important") != "important" or notify \
                 or (metadata or {}).get("is_approval_prompt"):
             return {}
         return {"disable_notification": True}

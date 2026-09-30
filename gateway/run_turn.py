@@ -4255,9 +4255,11 @@ class GatewayTurnMixin:
                         session_key, agent_holder[0], _executor_task_holder[0]
                     ):
                         break
+                    # An automatic "still working" status: explicitly silent (Telegram disable_notification).
                     _notify_res = await _notify_adapter.send(
                         source.chat_id, _heartbeat_text,
-                        metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
+                        metadata={**_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
+                                  "notify": False},
                     )
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
