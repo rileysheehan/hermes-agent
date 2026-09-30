@@ -236,6 +236,10 @@ def cmd_send(args: argparse.Namespace) -> None:
     tool_args = {"action": "send", "target": target, "message": message}
     if mentions:
         tool_args["mentions"] = mentions
+    # --silent / --notify: an explicit per-message notification choice (Telegram's disable_notification).
+    notify = getattr(args, "notify", None)
+    if notify is not None:
+        tool_args["notify"] = notify
     result = send_message_tool(tool_args)
     sys.exit(_emit_result(result, json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False)))
 
@@ -255,6 +259,11 @@ _SEND_ARGUMENTS = (
     (("--mention",), dict(dest="mentions", action="append", default=None, metavar="PHONE_OR_JID", help=(
         "WhatsApp only: add a native participant mention. Repeat for multiple recipients; "
         "bare phone numbers are normalized to JIDs. Include each matching @<number> near the start of the message text."))),
+    (("--silent",), dict(dest="notify", action="store_const", const=False, default=None, help=(
+        "Telegram only: deliver without a notification sound (Bot API disable_notification=true). "
+        "The message still arrives and stays in the chat."))),
+    (("--notify",), dict(dest="notify", action="store_const", const=True, help=(
+        "Telegram only: deliver with a normal notification (disable_notification=false, set explicitly)."))),
     (("-l", "--list"), dict(dest="list_targets", action="store_true", default=False,
                             help="List available targets. Optional positional filter: `hermes send --list telegram`.")),
     (("-q", "--quiet"), dict(action="store_true", default=False, help="Suppress stdout on success (exit code only).")),
