@@ -256,13 +256,65 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
+async def _edit_telegram(token, chat_id, message_id, message, disable_link_previews=False):
+    """Replace the text of a message this bot sent (Bot API ``editMessageText``). One message only: no media, no
+    chunking (over 4096 UTF-16 units is an error, so the caller can send a fresh message instead). An edit never
+    notifies. "Message is not modified" counts as success. Parse failures fall back to plain text."""
+    try:
+        from gateway.platforms.base import utf16_len
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        formatted, parse_mode, has_html = _telegram_format(message)
+        if not formatted.strip():
+            return _error("Telegram edit needs text")
+        if utf16_len(formatted) > 4096:
+            return _error("Telegram edit too long for one message (4096 UTF-16 units); send a new message instead")
+        bot = _telegram_bot(token)
+        kwargs = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id),
+                  **({"disable_web_page_preview": True} if disable_link_previews else {})}
+        try:
+            try:
+                await bot.edit_message_text(text=formatted, parse_mode=parse_mode, **kwargs)
+            except Exception as md_error:
+                err_text = str(md_error).lower()
+                if "not modified" in err_text:
+                    raise
+                if "parse" in err_text or "markdown" in err_text or "html" in err_text:
+                    await bot.edit_message_text(text=formatted if has_html else _strip_mdv2_safe(formatted),
+                                                parse_mode=None, **kwargs)
+                else:
+                    raise
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+        return _success("telegram", chat_id, message_id=str(message_id), edited=True)
+    except ImportError:
+        return {"error": "python-telegram-bot not installed. Run: "
+                f"{install_hint('telegram')}"}
+    except Exception as e:
+        return _error(f"Telegram edit failed: {e}")
+
+
+def _telegram_reply_kwargs(reply_to):
+    """Reply to ``reply_to`` (a message id in the same chat), and still deliver if that message is gone."""
+    if reply_to is None:
+        return {}
+    try:
+        from telegram import ReplyParameters
+        return {"reply_parameters": ReplyParameters(message_id=int(reply_to), allow_sending_without_reply=True)}
+    except ImportError:  # older python-telegram-bot
+        return {"reply_to_message_id": int(reply_to), "allow_sending_without_reply": True}
+
+
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
-                         disable_notification=None):
+                         disable_notification=None, reply_to=None, preview_url=None):
     """One-shot Telegram Bot API send; parse failures fall back to plain text.
 
     ``disable_notification``: None leaves the Bot API default (the recipient is notified); True/False is sent
     explicitly on every text chunk and media upload (Bot API: "Sends the message silently. Users will receive
-    a notification with no sound."). Whether a phone then shows a banner is the client's business."""
+    a notification with no sound."). Whether a phone then shows a banner is the client's business.
+    ``reply_to``: the first text chunk (or the first upload, when there is no text) replies to that message id,
+    with ``allow_sending_without_reply`` so a deleted original never costs the delivery.
+    ``preview_url``: the link whose card to show (``link_preview_options.url``), when the first link should not have it."""
     try:
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
@@ -277,6 +329,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                          **({} if disable_notification is None else {"disable_notification": bool(disable_notification)})}
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
+        if preview_url and not disable_link_previews:
+            try:
+                from telegram import LinkPreviewOptions
+                text_kwargs["link_preview_options"] = LinkPreviewOptions(url=preview_url)
+            except ImportError:
+                pass
         last_msg, warnings, _tg_caption = None, [], None
         # MEDIA caption rides on the bubble as its *formatted* caption; formatting can inflate a
         # raw <1024 string past Telegram's cap, so re-check in UTF-16 units.
@@ -284,8 +342,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
+        reply_kwargs = _telegram_reply_kwargs(reply_to)  # consumed by the first message actually sent
         for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
-            last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
+            kw = {**text_kwargs, **reply_kwargs} if reply_kwargs else text_kwargs
+            last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, kw)
+            if kw is not text_kwargs and "message_thread_id" not in kw:
+                text_kwargs.pop("message_thread_id", None)  # thread-not-found fallback carries to later chunks
+            reply_kwargs = {}
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
@@ -294,8 +357,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 if _tg_caption is not None and last_msg is None:
                     try:
                         last_msg = await _send_telegram_message_with_retry(
-                            bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode, **text_kwargs)
-                        _tg_caption = None  # delivered — don't re-caption a later file
+                            bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode,
+                            **text_kwargs, **reply_kwargs)
+                        _tg_caption, reply_kwargs = None, {}  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning("Telegram caption-fallback send failed for missing media: %s",
                                        _sanitize_error_text(_cap_err))
@@ -303,7 +367,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 last_msg = await _telegram_send_one_media(
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
-                    has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
+                    has_html=_has_html, thread_kwargs={**thread_kwargs, **reply_kwargs}, force_document=force_document)
+                reply_kwargs = {}
             except Exception as e:
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
                 logger.error(warnings[-1])
