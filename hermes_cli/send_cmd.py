@@ -236,6 +236,28 @@ def cmd_send(args: argparse.Namespace) -> None:
     tool_args = {"action": "send", "target": target, "message": message}
     if mentions:
         tool_args["mentions"] = mentions
+    # --silent / --notify: an explicit per-message notification choice (Telegram's disable_notification).
+    notify = getattr(args, "notify", None)
+    if notify is not None:
+        tool_args["notify"] = notify
+    telegram_only = {"--reply-to": getattr(args, "reply_to", None), "--edit": getattr(args, "edit", None),
+                     "--no-preview/--preview": getattr(args, "link_preview", None)}
+    used = [flag for flag, value in telegram_only.items() if value is not None]
+    if used and target.split(":", 1)[0].strip().lower() != "telegram":
+        _fail(f"hermes send: {', '.join(used)} only supported for Telegram targets.", _USAGE_EXIT)
+    for flag in ("reply_to", "edit"):
+        value = getattr(args, flag, None)
+        if value is not None and not str(value).strip().isdigit():
+            _fail(f"hermes send: --{flag.replace('_', '-')} needs a numeric Telegram message id.", _USAGE_EXIT)
+    if getattr(args, "edit", None) is not None:
+        if getattr(args, "reply_to", None) is not None or notify is not None:
+            _fail("hermes send: --edit changes a message in place: it cannot reply, and an edit never notifies.",
+                  _USAGE_EXIT)
+        tool_args.update(action="edit", edit_message_id=str(args.edit).strip())
+    if getattr(args, "reply_to", None) is not None:
+        tool_args["reply_to"] = str(args.reply_to).strip()
+    if getattr(args, "link_preview", None) is not None:
+        tool_args["link_preview"] = args.link_preview
     result = send_message_tool(tool_args)
     sys.exit(_emit_result(result, json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False)))
 
@@ -255,6 +277,20 @@ _SEND_ARGUMENTS = (
     (("--mention",), dict(dest="mentions", action="append", default=None, metavar="PHONE_OR_JID", help=(
         "WhatsApp only: add a native participant mention. Repeat for multiple recipients; "
         "bare phone numbers are normalized to JIDs. Include each matching @<number> near the start of the message text."))),
+    (("--silent",), dict(dest="notify", action="store_const", const=False, default=None, help=(
+        "Telegram only: deliver without a notification sound (Bot API disable_notification=true). "
+        "The message still arrives and stays in the chat."))),
+    (("--notify",), dict(dest="notify", action="store_const", const=True, help=(
+        "Telegram only: deliver with a normal notification (disable_notification=false, set explicitly)."))),
+    (("--reply-to",), dict(metavar="MESSAGE_ID", default=None, help=(
+        "Telegram only: reply to that message in the same chat (still delivered if it was deleted)."))),
+    (("--edit",), dict(metavar="MESSAGE_ID", default=None, help=(
+        "Telegram only: replace the text of that message (one this bot sent) instead of sending a new one. "
+        "An edit makes no sound; use a new message for news."))),
+    (("--no-preview",), dict(dest="link_preview", action="store_const", const=False, default=None, help=(
+        "Telegram only: no link preview for this message."))),
+    (("--preview",), dict(dest="link_preview", action="store_const", const=True, help=(
+        "Telegram only: allow a link preview even when disable_link_previews is set."))),
     (("-l", "--list"), dict(dest="list_targets", action="store_true", default=False,
                             help="List available targets. Optional positional filter: `hermes send --list telegram`.")),
     (("-q", "--quiet"), dict(action="store_true", default=False, help="Suppress stdout on success (exit code only).")),
