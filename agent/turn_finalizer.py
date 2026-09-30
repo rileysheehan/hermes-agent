@@ -868,6 +868,24 @@ def finalize_turn(
     if _should_review_skills:
         agent._iters_since_skill = 0
 
+    # A one-shot process (kanban worker, -q/-Q, an orchestrator resuming the same session once
+    # per wake) ends after THIS turn. The turn-based memory nudge (default: every 10 user turns,
+    # hydrated from history on --resume) then needs ten separate runs of one session to fire, so
+    # a run's learnings are almost never consolidated. Opt in per install with
+    # ``auxiliary.background_review.oneshot_learning``; it only fires for a SUBSTANTIVE turn
+    # (``oneshot_min_tool_calls`` tool calls, default: the skill nudge interval) so a
+    # trivial probe costs nothing. ``skip_background_review`` (cron) still wins.
+    if (
+        not _should_review_memory
+        and not getattr(agent, "skip_background_review", False)
+        and "memory" in getattr(agent, "valid_tool_names", set())
+        and getattr(agent, "_memory_store", None)
+    ):
+        with suppress(Exception):
+            from agent.background_review import oneshot_memory_review_due, turn_tool_call_count
+
+            _should_review_memory = oneshot_memory_review_due(agent, turn_tool_call_count(messages))
+
     _mirror_turn_to_memory(
         agent, original_user_message=original_user_message, final_response=final_response,
         interrupted=interrupted, messages=messages, review_memory=_should_review_memory,

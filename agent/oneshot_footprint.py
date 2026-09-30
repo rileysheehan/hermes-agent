@@ -18,6 +18,10 @@ Nobody answers or steers a one-shot either, so it also drops what only an intera
 ``clarify`` (its toolset is disabled for the session), the mid-turn steering briefing in the system prompt,
 and ``delegate_task``'s live-control surface (children are joined inside the call, so ``action``
 list/steer/stop never has a running child to reach).
+
+An install whose one-shot runs ARE a longer-lived identity (an orchestrator that resumes the same session
+once per wake) opts back into learning with ``auxiliary.background_review.oneshot_learning``: skill_manage
+stays, the post-turn review may fire, and the CLI waits a bounded time for it at exit.
 """
 from __future__ import annotations
 
@@ -50,6 +54,19 @@ def is_single_query_session() -> bool:
     return str(get_session_env("HERMES_SINGLE_QUERY_SESSION", "") or "") == "1"
 
 
+def oneshot_learning() -> bool:
+    """A one-shot session whose install opted into learning (``auxiliary.background_review.oneshot_learning``):
+    the run is one turn of a longer-lived identity (an orchestrator resuming the same session per wake),
+    so ``skill_manage`` stays available for the post-turn review. Never raises."""
+    if not is_single_query_session():
+        return False
+    try:
+        from agent.background_review import oneshot_learning_enabled
+        return oneshot_learning_enabled()
+    except Exception:
+        return False
+
+
 ONESHOT_SKILLS_LOAD_GUIDANCE = (
     "## Skills\n"
     "Scan the skills below and load one with skill_view(name) only when it carries domain knowledge you lack "
@@ -76,3 +93,21 @@ def oneshot_tool_schemas(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if (tool.get("function") or {}).get("name") == "delegate_task" else tool
         for tool in tools
     ]
+
+
+# Same economy, but the session continues on a later run: a skill that was wrong may be fixed.
+ONESHOT_LEARNING_SKILLS_LOAD_GUIDANCE = (
+    "## Skills\n"
+    "Scan the skills below and load one with skill_view(name) only when it carries domain knowledge you lack "
+    "for THIS task (an API, a tool's commands, a project's conventions). Do not load general process skills "
+    "(testing, debugging, review methodology) for work you already know how to do. If a skill you loaded had "
+    "wrong commands or missing steps, fix it with skill_manage(action='patch'); a review after this run "
+    "handles anything else worth keeping.\n"
+)
+
+
+def oneshot_skills_guidance() -> str:
+    """The one-shot ## Skills header for this session, or ``""`` when the session is not one-shot."""
+    if not is_single_query_session():
+        return ""
+    return ONESHOT_LEARNING_SKILLS_LOAD_GUIDANCE if oneshot_learning() else ONESHOT_SKILLS_LOAD_GUIDANCE
