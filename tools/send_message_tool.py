@@ -270,9 +270,17 @@ def _handle_send(args):
         mentions = args.get("mentions")
         if mentions and platform_name == "whatsapp":
             handler_args["mentions"] = [mentions] if isinstance(mentions, str) else list(mentions)
+        # Per-message notification choice (``hermes send --silent/--notify``): passed only when set, so the
+        # default path is byte-for-byte unchanged. Only the Telegram sender honours it.
+        notify = args.get("notify")
+        if notify is not None:
+            handler_args["notify"] = bool(notify)
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
+        if isinstance(result, dict) and result.get("success") and notify is not None and platform_name != "telegram":
+            result["warnings"] = [*result.get("warnings", []), f"notify={'on' if notify else 'off'} is only supported "
+                                  f"for telegram; {platform_name} used its default"]
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
@@ -685,10 +693,13 @@ _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, fei
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
-                            force_document=False, mentions=None, args=None):
+                            force_document=False, mentions=None, args=None, notify=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
-    lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
+    lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text.
+
+    ``notify``: None = platform default; False = silent; True = explicitly notify. Only the Telegram
+    sender honours it (Bot API ``disable_notification``); ``_handle_send`` warns for other platforms."""
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
@@ -698,7 +709,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.TELEGRAM:
         return await _send_telegram(
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
-            disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
+            disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")),
+            disable_notification=None if notify is None else not notify)
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
