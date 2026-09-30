@@ -39,6 +39,8 @@ def send_message_tool(args, **kw):
         return _handle_list()
     if action in ("react", "unreact"):
         return _handle_react(args, remove=action == "unreact")
+    if action == "edit":
+        return _handle_edit(args)
     return _handle_send(args)
 
 
@@ -277,12 +279,18 @@ def _handle_send(args):
         notify = args.get("notify")
         if notify is not None:
             handler_args["notify"] = bool(notify)
+        if platform_name == "telegram":
+            if str(args.get("reply_to") or "").strip():
+                handler_args["reply_to"] = str(args["reply_to"]).strip()
+            if args.get("link_preview") is not None:
+                handler_args["link_preview"] = bool(args["link_preview"])
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
-        if isinstance(result, dict) and result.get("success") and notify is not None and platform_name != "telegram":
-            result["warnings"] = [*result.get("warnings", []), f"notify={'on' if notify else 'off'} is only supported "
-                                  f"for telegram; {platform_name} used its default"]
+        unsupported = [k for k in _TELEGRAM_ONLY_ARGS if args.get(k) not in (None, "")]
+        if isinstance(result, dict) and result.get("success") and unsupported and platform_name != "telegram":
+            result["warnings"] = [*result.get("warnings", []), f"{', '.join(unsupported)}: only supported for "
+                                  f"telegram; {platform_name} used its default"]
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
@@ -302,6 +310,65 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _telegram_preview(pconfig, message, link_preview=None):
+    """The link-preview choice for one message, as the adapter makes it: the per-message ``link_preview`` wins, then
+    ``disable_link_previews``, then ``link_preview_skip_hosts``. Returns ``(disable_link_previews, preview_url)``."""
+    if link_preview is not None:
+        return (not link_preview), None
+    extra = getattr(pconfig, "extra", None) or {}
+    if extra.get("disable_link_previews"):
+        return True, None
+    from plugins.platforms.telegram.link_previews import link_preview_choice, parse_skip_hosts
+    choice = link_preview_choice(message, parse_skip_hosts(extra.get("link_preview_skip_hosts")))
+    return choice is False, (choice if isinstance(choice, str) else None)
+
+
+_TELEGRAM_ONLY_ARGS = ("notify", "reply_to", "link_preview")
+
+
+def _handle_edit(args):
+    """Replace the text of a message this bot sent earlier (Telegram ``editMessageText``; ``hermes send --edit``).
+    Same target resolution and egress guard as a send. An edit makes no sound and moves nothing in the chat, so it
+    suits a status that changes (queued -> working -> in review); news that matters goes in a new message."""
+    target, message = args.get("target", ""), args.get("message", "")
+    message_id = str(args.get("edit_message_id") or "").strip()
+    if not target or not message or not message_id.isdigit():
+        return tool_error("'target', 'message' and a numeric 'edit_message_id' are required to edit")
+    from agent.message_sanitization import _sanitize_surrogates
+    message = _sanitize_surrogates(message)
+    platform_name, chat_id, thread_id, resolution_error = _resolve_tool_target(target)
+    if resolution_error:
+        return tool_error(resolution_error)
+    if platform_name != "telegram":
+        return tool_error(f"Editing a sent message is only supported for telegram, not {platform_name}")
+    try:
+        from gateway.config import load_gateway_config
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+    platform, pconfig, _entry, err = _resolve_platform_config(platform_name, config)
+    if err:
+        return tool_error(err)
+    if not chat_id:
+        chat_id, err = _home_chat_id(config, platform, platform_name)
+        if err:
+            return tool_error(err)
+    _relay_denial = _authorize_relay_target(platform_name, chat_id, thread_id,
+                                            native_token=getattr(pconfig, "token", None))
+    if _relay_denial:
+        return tool_error(_relay_denial)
+    try:
+        from model_tools import _run_async
+        from tools.send_message_senders import _edit_telegram
+        result = _run_async(_edit_telegram(pconfig.token, chat_id, message_id, message,
+                                           disable_link_previews=_telegram_preview(pconfig, message, args.get("link_preview"))[0]))
+        if isinstance(result, dict) and "error" in result:
+            result["error"] = _sanitize_error_text(result["error"])
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps(_error(f"Edit failed: {e}"))
 
 
 def _platform_enum(platform_name):
@@ -695,13 +762,16 @@ _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, fei
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
-                            force_document=False, mentions=None, args=None, notify=None):
+                            force_document=False, mentions=None, args=None, notify=None, reply_to=None,
+                            link_preview=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text.
 
     ``notify``: None = platform default; False = silent; True = explicitly notify. Only the Telegram
-    sender honours it (Bot API ``disable_notification``); ``_handle_send`` warns for other platforms."""
+    sender honours it (Bot API ``disable_notification``); ``_handle_send`` warns for other platforms.
+    ``reply_to`` (reply to that message id) and ``link_preview`` (False = no preview for this message, True = a
+    preview even when the config disables them) are Telegram-only in the same way."""
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
@@ -711,8 +781,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.TELEGRAM:
         return await _send_telegram(
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
-            disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")),
-            disable_notification=None if notify is None else not notify)
+            disable_link_previews=_telegram_preview(pconfig, message, link_preview)[0],
+            preview_url=_telegram_preview(pconfig, message, link_preview)[1],
+            disable_notification=None if notify is None else not notify, reply_to=reply_to)
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
