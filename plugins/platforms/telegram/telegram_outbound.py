@@ -42,7 +42,10 @@ def resolve_notifications_mode() -> str:
 
 
 def notification_kwargs(mode: str, notify: bool | None) -> dict:
-    """Bot API kwargs for one send: silent under ``important`` unless the caller asks to ``notify``."""
+    """Bot API kwargs for one send: silent under ``important`` unless the caller asks to ``notify``; an
+    explicit ``notify=False`` (`hermes send --silent`) is silent in every mode."""
+    if notify is False:
+        return {"disable_notification": True}
     return {} if mode != "important" or notify else {"disable_notification": True}
 
 
@@ -58,7 +61,9 @@ def _standalone_adapter(bot, extra: dict):
 
 
 def _metadata(thread_id, notify) -> dict:
-    return {**({"thread_id": str(thread_id)} if thread_id is not None else {}), **({"notify": True} if notify else {})}
+    # An explicit False rides along too: the adapter keeps it silent in every notifications mode.
+    return {**({"thread_id": str(thread_id)} if thread_id is not None else {}),
+            **({} if notify is None else {"notify": bool(notify)})}
 
 
 async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, thread_id=None, notify=None):

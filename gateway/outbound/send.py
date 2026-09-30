@@ -219,9 +219,17 @@ def _handle_send(args):
         mentions = args.get("mentions")
         if mentions and entry is not None and entry.standalone_send is not None and entry.standalone_send.mentions:
             handler_args["mentions"] = [mentions] if isinstance(mentions, str) else list(mentions)
+        # Per-message notification choice (``hermes send --silent/--notify``): passed only when set, so the
+        # default path is byte-for-byte unchanged. Only the Telegram sender honours it.
+        notify = args.get("notify")
+        if notify is not None:
+            handler_args["notify"] = bool(notify)
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
+        if isinstance(result, dict) and result.get("success") and notify is not None and platform_name != "telegram":
+            result["warnings"] = [*result.get("warnings", []), f"notify={'on' if notify else 'off'} is only supported "
+                                  f"for telegram; {platform_name} used its default"]
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
@@ -675,7 +683,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                             force_document=False, mentions=None, args=None, notify=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
-    lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
+    lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text.
+
+    ``notify``: None = the platform's own rule (Telegram: its notifications mode); False = silent in every
+    mode; True = rings. Only the Telegram sender honours it (Bot API ``disable_notification``);
+    ``_handle_send`` warns for other platforms."""
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
