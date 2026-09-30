@@ -91,11 +91,14 @@ import {
   isHostKeyChangedBootFailure,
   isRetryableRemoteBootFailure,
   isSshAuthFailedBootFailure,
+  isSshClientFailedBootFailure,
   shouldHoldBootProgressForReauth,
   shouldLatchBackendStartFailure,
   shouldLatchHostKeyChangedFailure,
   shouldLatchRemoteReauthFailure,
-  shouldLatchSshAuthFailure
+  shouldLatchSshAuthFailure,
+  shouldLatchSshClientFailure,
+  sshClientFailedError
 } from './backend-start-failure'
 import { describeBootstrapFailure } from './bootstrap-failure-copy'
 import {
@@ -200,10 +203,11 @@ import {
   updateEligibility,
   upsertConnection
 } from './connection-registry'
+import type { RegistryConnection } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
 import { liveWindowState, overlayWindowState } from './connection-window-state'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
-import { adoptServedDashboardToken, resolveServedDashboardToken } from './dashboard-token'
+import { adoptServedDashboardToken, isAttachedBackendTokenDrifted, resolveServedDashboardToken } from './dashboard-token'
 import { resolveDesktopHermesHome, resolveDesktopUserData } from './data-paths'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine, formatLogStamp } from './desktop-log-line'
@@ -323,7 +327,16 @@ import { isAuthWall, resolveLinkTitle } from './link-title-wall'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { CHROMIUM_LOG_FILENAME, enableLinuxCrashDiagnostics, linuxCrashDiagnostics } from './linux-crash-diagnostics'
 import { notifyLauncherWindowRevealed } from './linux-launcher-ready'
-import { decideNvidiaEglFallback, parseNvidiaDriverMajor } from './linux-nvidia-egl-fallback'
+import {
+  decideNvidiaEglFallback,
+  nvidiaEglFallbackMarker,
+  nvidiaEglMarkerAfterSuccessfulBoot,
+  parseNvidiaDriverMajor,
+  parseNvidiaDriverVersion,
+  readNvidiaEglMarker,
+  shouldRelaunchForNvidiaGpuDeath,
+  writeNvidiaEglMarker
+} from './linux-nvidia-egl-fallback'
 import { createLocalBackendLifecycle, waitForTeardown } from './local-backend-lifecycle'
 import { resolveIpcFileReadPath, resolveMediaStreamFile, resolvePreviewTargetPath } from './local-read-path'
 import { localSkinProfileKey, readLocalSkinPayload } from './local-skin'
@@ -395,7 +408,7 @@ import {
   localRouteFallbackProfiles,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
-import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
+import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS, POOL_LIMITS_MIN } from './pool-limits'
 import { createPoolRetirer } from './pool-retire'
 import { createPoolRetirementClient } from './pool-retire-http'
 import {
@@ -476,6 +489,7 @@ import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
   ensureHealthyPooledRemoteBackendForDispatch,
+  REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS,
   RemoteLivenessTracker,
   RemoteRevalidationCoordinator,
   revalidatePooledRemoteBackends,
@@ -522,6 +536,7 @@ import { ensureLoginShellPath } from './shell-path'
 import { removeStaleSingletonLock } from './singleton-lock'
 import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
 import { resolveSourcePython } from './source-python'
+import { resolveSshBinary } from './ssh-binary'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
@@ -546,6 +561,7 @@ import {
 } from './translucency'
 import { updateGateReason, waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import { updateConnectionsBeforeLocal } from './update-order'
 import {
   resolveUpdaterMechanism,
   type UpdaterApplyResultWire,
@@ -558,7 +574,8 @@ import {
   resolveStagedUpdaterBinary,
   resolveVenvDir,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker
+  stagedUpdaterSupportsPrewrittenMarker,
+  userLauncherInstallRoot
 } from './updater-process'
 import { AppInstallerStrategy } from './updater/app-installer'
 import { createChannelAppInstallerStrategy } from './updater/app-installer'
@@ -595,6 +612,7 @@ import {
   WindowConnectionRouteRegistry
 } from './window-connection-route'
 import { registerWindowControlIpc, windowControlState } from './window-controls'
+import { revealAction, shouldFocusToTakeKeyboard } from './window-focus-policy'
 import { createWindowOpenHandler } from './window-open-policy'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { wireWindowReveal } from './window-reveal'
@@ -773,36 +791,108 @@ if (IS_WSL && !REMOTE_DISPLAY_REASON && fs.existsSync('/dev/dxg')) {
   console.log('[hermes] WSL GPU passthrough (/dev/dxg) detected; enabling GPU acceleration')
 }
 
-// #40077: NVIDIA driver 580.x breaks ANGLE's EGL probing (Invalid visual ID),
-// killing the GPU process at startup. Route ANGLE through its SwiftShader
-// backend instead — the app then launches and stays up (CPU rendering, slow
-// but stable). Deliberately NOT disableHardwareAcceleration(): on 580.173.02 +
-// Electron 40 that SIGKILLs the renderer (see the closed #40119). Must run
-// before app `ready` — the switch only applies pre-launch. Override with
-// HERMES_DESKTOP_NVIDIA_SWIFTSHADER (1/true → force on, 0/false → never).
+// #40077 / #124255: NVIDIA driver 580.x breaks ANGLE's EGL probing (Invalid
+// visual ID), killing the GPU process at startup. Route ANGLE through its
+// SwiftShader backend when the breakage is WITNESSED, not assumed: the same
+// point release breaks hosts where NVIDIA drives the display and renders fine
+// on hybrid hosts whose session EGL lands on the iGPU, so a driver-series gate
+// burns 4-9 CPU cores on healthy hosts (#124255). The gate is now behavioral —
+// boot with hardware GL and a marker; a GPU-process death before the first
+// window flips the marker sticky (per app + full driver version) and relaunches
+// once with SwiftShader. Deliberately NOT disableHardwareAcceleration(): on
+// 580.173.02 + Electron 40 that SIGKILLs the renderer (see the closed #40119).
+// Must run before app `ready` — the switch only applies pre-launch. Override
+// with HERMES_DESKTOP_NVIDIA_SWIFTSHADER (1/true → force on, 0/false → never).
+const NVIDIA_PROC_VERSION = (() => {
+  try {
+    return fs.readFileSync('/proc/driver/nvidia/version', 'utf8')
+  } catch {
+    return ''
+  }
+})()
+
+const NVIDIA_DRIVER_MAJOR = parseNvidiaDriverMajor(NVIDIA_PROC_VERSION)
+const NVIDIA_DRIVER_VERSION = parseNvidiaDriverVersion(NVIDIA_PROC_VERSION)
+
+let nvidiaEglFallbackActive = false
+let nvidiaEglRelaunchAttempted = false
+
 const NVIDIA_EGL_FALLBACK = decideNvidiaEglFallback({
-  driverMajor: parseNvidiaDriverMajor(
-    (() => {
-      try {
-        return fs.readFileSync('/proc/driver/nvidia/version', 'utf8')
-      } catch {
-        return ''
-      }
-    })()
-  ),
+  driverMajor: NVIDIA_DRIVER_MAJOR,
+  driverVersion: NVIDIA_DRIVER_VERSION,
+  marker: readNvidiaEglMarker(app.getPath('userData')),
+  appVersion: app.getVersion(),
   env: process.env,
   platform: process.platform,
   isWsl: IS_WSL,
   remoteDisplayReason: REMOTE_DISPLAY_REASON
 })
 
+nvidiaEglFallbackActive = NVIDIA_EGL_FALLBACK.enable
+
+// Persist the launch decision before GPU children start: a `booting` marker
+// left behind by a launch that never reached first paint is itself evidence
+// of a GPU death (the "GPU process isn't usable" FATAL abort wins the race
+// against our relaunch handler), and the next launch engages from it.
+if (NVIDIA_DRIVER_MAJOR !== null) {
+  try {
+    writeNvidiaEglMarker(app.getPath('userData'), NVIDIA_EGL_FALLBACK.nextMarker)
+  } catch {
+    void 0
+  }
+}
+
 if (NVIDIA_EGL_FALLBACK.enable) {
   app.commandLine.appendSwitch('use-angle', 'swiftshader')
   console.log(
     `[hermes] NVIDIA EGL fallback enabled (${NVIDIA_EGL_FALLBACK.reason}); routing ANGLE ` +
-      'through SwiftShader to avoid the NVIDIA 580-series EGL probe crash (#40077). ' +
-      'HERMES_DESKTOP_NVIDIA_SWIFTSHADER=0 to opt out.'
+      'through SwiftShader. Witnessed GPU-process death probe (#40077, #124255); an app or ' +
+      'driver update re-probes hardware GL once. HERMES_DESKTOP_NVIDIA_SWIFTSHADER=0 to opt out.'
   )
+}
+
+// The behavioral half of the gate: a GPU-process death on a Linux NVIDIA host
+// that booted with hardware GL is the #40077 signature. Catch it before
+// Chromium's "GPU process isn't usable" FATAL abort ends the process, flip the
+// marker sticky, and relaunch once with SwiftShader. `killed` counts (the
+// #40077 GPU process died to Chromium's health-check SIGTERM, exit_code=15).
+if (NVIDIA_DRIVER_MAJOR !== null && process.platform === 'linux') {
+  app.on('child-process-gone', (_event, details) => {
+    if (
+      !shouldRelaunchForNvidiaGpuDeath({
+        details,
+        fallbackActive: nvidiaEglFallbackActive,
+        relaunchAttempted: nvidiaEglRelaunchAttempted
+      })
+    ) {
+      return
+    }
+
+    nvidiaEglRelaunchAttempted = true
+
+    try {
+      writeNvidiaEglMarker(
+        app.getPath('userData'),
+        nvidiaEglFallbackMarker(app.getVersion(), NVIDIA_DRIVER_VERSION ?? String(NVIDIA_DRIVER_MAJOR))
+      )
+    } catch {
+      void 0
+    }
+
+    console.warn(
+      `[hermes] NVIDIA GPU process died (reason=${details?.reason}, exit=${details?.exitCode}); ` +
+        'relaunching once with --use-angle=swiftshader (#40077, #124255)'
+    )
+
+    try {
+      app.relaunch({
+        args: [...process.argv.slice(1), '--use-angle=swiftshader']
+      })
+      void exitAfterBackendShutdown(0)
+    } catch (error) {
+      console.error(`[hermes] NVIDIA SwiftShader relaunch failed: ${error?.message || error}`)
+    }
+  })
 }
 
 // Linux: point Chromium at the session's keychain backend so safeStorage can
@@ -1008,6 +1098,10 @@ const HERMES_HOME: string = resolveDesktopHermesHome({
 // Start-menu / .desktop entry ran with no `--js-flags` at all. Apply them here
 // from config.yaml, before `ready` — Chromium copies `js-flags` to renderer
 // processes only from the browser's pre-launch command line.
+// `desktop.ssh_path` (#103288) rides the same pre-window read: an explicit
+// Windows ssh client for when the in-box OpenSSH is missing or broken.
+let desktopSshPathOverride = ''
+
 {
   let desktopLaunchYaml: string = ''
 
@@ -1018,6 +1112,7 @@ const HERMES_HOME: string = resolveDesktopHermesHome({
   }
 
   const desktopLaunchConfig = readDesktopLaunchConfig(desktopLaunchYaml)
+  desktopSshPathOverride = desktopLaunchConfig.sshPath || ''
 
   // `desktop.renderer_accessibility: false` must reach packaged launches too,
   // not only the `hermes desktop` launcher's env bridge (#118271).
@@ -1662,6 +1757,14 @@ function spawnOwnedBackend(...args: Parameters<typeof spawn>): ChildProcess {
 }
 
 const remoteLiveness = new RemoteLivenessTracker()
+// Pooled remotes are probed on the renderer reconnect cadence (minutes apart),
+// not the primary's sub-minute retry loop, so they need a failure window wider
+// than that cadence or a dead pooled descriptor's streak resets on every tick
+// and it is never dropped (#94381).
+const pooledRemoteLiveness = new RemoteLivenessTracker(
+  undefined,
+  REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS
+)
 const remoteRevalidation = new RemoteRevalidationCoordinator()
 const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
 // Single-owner reconnect/dial claim (#90812): reconnectGateway()'s in-flight
@@ -1883,6 +1986,20 @@ function setPoolLimits(raw) {
 const POOL_KEEPALIVE_FRESH_MS = Math.max(
   120_000,
   Number(process.env.HERMES_DESKTOP_POOL_KEEPALIVE_FRESH_MS) || 4 * 60_000
+)
+
+// Pinned-tier TTL (#105239): the renderer's 60s keepalive (touchPoolBackend)
+// refreshes lastActiveAt for every OPEN chat, so the idle reaper's only clock
+// never fires for the pinned tier — every profile whose chat was ever opened
+// held its ~120 MB serve child until app quit (126 processes / 7.5 GB on the
+// reporter's machine, all parented to Hermes.exe). A keepalive proves the
+// chat is open, not that anything streamed: retire a local child whose last
+// streamed turn is older than this window. Re-focusing the chat re-ensures it
+// idempotently (ensureBackend/ensureRegistryBackend reuse), and mid-stream
+// safety is unchanged — activeTurn entries are excluded by the retirer.
+const POOL_PINNED_IDLE_MS = Math.max(
+  POOL_LIMITS_MIN.idleMs,
+  Number(process.env.HERMES_DESKTOP_POOL_PINNED_IDLE_MS) || 60 * 60_000
 )
 
 let poolIdleReaper = null
@@ -2702,7 +2819,16 @@ function updateGateDeps() {
   return {
     hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)),
     isUpdateInFlight: () => updateInFlight,
-    isHandoffActive: () => isQuittingForHandoff
+    isHandoffActive: () => isQuittingForHandoff,
+    // The latest receipt is cross-process truth: a `hermes update` that failed
+    // records outcome "failed" even when its marker write/release raced a
+    // crash (#122206). Only a TERMINAL failure counts — "running" must keep
+    // parking, and "partial" kept the install usable.
+    hasFailedReceipt: () => {
+      const receipt = readLatestSyncReceipt()
+
+      return receipt?.outcome === 'failed'
+    }
   }
 }
 
@@ -2764,9 +2890,27 @@ function relaunchIntoSwappedBundle() {
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
   let announced = false
+  let parkedOnFailedReceipt = false
 
   const outcome = await waitForUpdateClearance(updateGateDeps(), {
     signal: localBackendLifecycle.signal,
+    abandonOn: reason => {
+      // The update that owns the gate already recorded a terminal failure
+      // (#122206): parking the full 20-minute budget on a receipt that says
+      // "failed" strands the window behind a dead updater (486 silent polls
+      // measured). Stop waiting; the failure dialog below carries the
+      // recovery guidance and the backend's own launch path finishes only
+      // what is safely retryable, bounded by venv_sync's completion-retry
+      // backoff.
+      if (reason === 'failed-receipt') {
+        parkedOnFailedReceipt = true
+        rememberLog('[updates] latest update receipt records a failure; not parking the boot on it')
+
+        return true
+      }
+
+      return false
+    },
     onWaitTick: async reason => {
       if (!announced) {
         announced = true
@@ -2847,6 +2991,11 @@ async function waitForUpdateToFinish() {
 
   if (outcome === 'timeout') {
     rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
+  } else if (parkedOnFailedReceipt) {
+    // The gate closed on a terminal failure, not a live update: no swap to
+    // relaunch into (the update never succeeded), so boot the current build
+    // and let the failure dialog above carry the recovery guidance.
+    rememberLog('[updates] proceeding with backend start despite the failed update receipt')
   } else if (relaunchIntoSwappedBundle()) {
     await advanceBootProgress('backend.update-restart', 'Restarting Hermes to load the updated app…', 14)
     // Park while the scheduled exit lands so this stale build never starts a
@@ -4488,6 +4637,15 @@ async function applyUpdates(): Promise<UpdaterApplyResultWire> {
     let handedOff: boolean = false
 
     try {
+      // The local handoff asks the window to exit and the update scripts only
+      // wait so long for that PID — never start that deadline while quit would
+      // still be gated on a managed SSH update or its recovery transaction
+      // (before-quit joins the same operations; the updater must not race them).
+      await waitForManagedUpdateOperations(() => [
+        ...managedConnectionUpdates.values(),
+        ...managedConnectionRecoveries.values()
+      ])
+
       const packaged: UpdaterStrategy | null = await resolvePackagedUpdateStrategy()
       const strategy: UpdaterStrategy = packaged ?? resolveCheckoutUpdateStrategy()
       const result: UpdaterApplyResultWire = await desktopMetrics.trackUpdateApply(packaged, strategy)
@@ -5097,9 +5255,32 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
 
   if (bootstrapRepairRequested) {
     rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
+  } else {
+    // 5. A source install outside ACTIVE_HERMES_ROOT (install.sh --dir, a
+    //    setup-hermes.sh clone), found through the launcher it published at a
+    //    fixed user-bin location: a Finder/Dock launch inherits a PATH without
+    //    ~/.local/bin. The reported root is then resolved and probed like any
+    //    installed runtime; HERMES_DESKTOP_IGNORE_EXISTING=1 skips it too.
+    const userInstall: ReturnType<typeof userLauncherInstallRoot> = userLauncherInstallRoot(IS_WINDOWS, HERMES_HOME)
+
+    if (userInstall) {
+      const userBackend: SourceBackend | null = await installedRuntimeGate.resolve(userInstall.root, () =>
+        resolveSourceInstallationBackend(userInstall.root, backendArgs, { hermesHome: HERMES_HOME })
+      )
+
+      if (userBackend) {
+        rememberLog(`[boot] Using Hermes install at ${userInstall.root} (published launcher ${userInstall.launcher})`)
+
+        return userBackend
+      }
+
+      rememberLog(`[bootstrap] Hermes install at ${userInstall.root} (from ${userInstall.launcher}) is not usable`)
+    } else {
+      rememberLog(`[bootstrap] no usable Hermes install at ${ACTIVE_HERMES_ROOT} and no published user-bin launcher`)
+    }
   }
 
-  // 5. Nothing usable yet -- signal the bootstrap runner that we need to
+  // 6. Nothing usable yet -- signal the bootstrap runner that we need to
   //    clone+install. Phase 1D's bootstrap-runner consumes this sentinel
   //    and drives install.ps1 stages with a progress UI. Until 1D lands,
   //    callers see the sentinel and surface it as a user-facing error
@@ -6823,11 +7004,16 @@ function sendOpenUpdatesRequested() {
 
   webContents.send('hermes:open-updates')
 
+  // #83998: never pump the Windows foreground from an ambient surface —
+  // showInactive + a guarded focus keep the raise from dismissing another
+  // app's native dialog.
   if (!mainWindow.isVisible()) {
-    mainWindow.show()
+    mainWindow.showInactive()
   }
 
-  mainWindow.focus()
+  if (shouldFocusToTakeKeyboard(mainWindow)) {
+    mainWindow.focus()
+  }
 }
 
 // Push titlebar/fullscreen chrome state to a window's renderer. Defaults to the
@@ -10111,11 +10297,25 @@ async function reachablePreviewUrl(webContentsId: number, rawUrl: string): Promi
   }
 }
 
+// The ssh client every desktop spawn uses (#103288): `desktop.ssh_path`, then
+// the in-box System32 OpenSSH, then Git for Windows' ssh.exe, then PATH.
+// Bare `ssh` on every other platform.
+function desktopSshBinary(): string {
+  return resolveSshBinary({
+    platform: process.platform,
+    override: desktopSshPathOverride,
+    env: {
+      systemRoot: process.env.SystemRoot || process.env.windir || 'C:\\Windows',
+      localAppData: process.env.LOCALAPPDATA || '',
+      programFiles: process.env['ProgramFiles'] || 'C:\\Program Files',
+      programFilesX86: process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+    },
+    fs: { existsSync: fileExists, readdirSync: dir => fs.readdirSync(dir) }
+  })
+}
+
 async function effectiveSshConfigFingerprint(sshConfig) {
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
+  const ssh = desktopSshBinary()
 
   const args = ['-G']
 
@@ -10128,7 +10328,17 @@ async function effectiveSshConfigFingerprint(sshConfig) {
   }
 
   args.push('--', sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host)
-  const output = await execText(ssh, args, { timeout: 10_000 })
+  let output: string
+
+  try {
+    output = await execText(ssh, args, { timeout: 10_000 })
+  } catch (error) {
+    // `ssh -G` only parses local config, so a failure here is the local client
+    // itself (missing, broken, or a bad ssh_config) and retrying cannot fix
+    // it. Tag it terminal so boot lands on the failure overlay instead of
+    // re-driving the same probe every ~2s (#103288).
+    throw sshClientFailedError(ssh, error)
+  }
 
   return crypto.createHash('sha256').update(output).digest('hex')
 }
@@ -10251,6 +10461,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
       {
         rememberLog: sshRememberLog,
+        sshBinary: desktopSshBinary(),
         ownershipId: sshOwnershipKey(profile),
         scope,
         effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint
@@ -10714,7 +10925,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
 
     const ssh = createSshProbeConnection(
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-      { rememberLog: sshRememberLog }
+      { rememberLog: sshRememberLog, sshBinary: desktopSshBinary() }
     )
 
     try {
@@ -11692,7 +11903,7 @@ async function openManagedSshUpdateTransport(
 
   const ssh = createSshProbeConnection(
     { host: config.host, user: config.user, port: config.port, keyPath: config.keyPath },
-    { rememberLog: sshRememberLog }
+    { rememberLog: sshRememberLog, sshBinary: desktopSshBinary() }
   )
 
   await ssh.open()
@@ -12003,6 +12214,13 @@ function touchPoolBackend(profile, options: { activeTurn?: boolean } = {}) {
 
       if (typeof options.activeTurn === 'boolean') {
         entry.activeTurn = options.activeTurn
+
+        // A prompt turn leasing this backend IS streamed activity (#105239):
+        // the keepalive touch alone only proves the chat is open, so the
+        // pinned-tier TTL reads this stamp, not lastActiveAt.
+        if (options.activeTurn) {
+          entry.lastStreamedAt = Date.now()
+        }
       }
 
       return
@@ -12033,10 +12251,26 @@ function startPoolIdleReaper() {
     const now = Date.now()
 
     for (const [profile, entry] of [...backendPool.entries()]) {
-      if (now - (entry.lastActiveAt || 0) > poolIdleMs()) {
-        // Remote descriptors hold no child/slot. Local children require the
-        // same admission authority as foreground and LRU reclamation.
-        const retiring = entry.process ? poolRetirer.retireIdle(profile, poolIdleMs()) : stopPoolBackend(profile)
+      // Remote descriptors hold no child/slot. Local children require the
+      // same admission authority as foreground and LRU reclamation.
+      // Pinned-tier TTL (#105239): the keepalive refreshes lastActiveAt for
+      // every open chat, so that clock alone never fires for the pinned tier.
+      // A local child whose last STREAMED turn (activeTurn touch) is older
+      // than POOL_PINNED_IDLE_MS is idle even while keepalive-fresh; entries
+      // without the stamp keep the legacy lastActiveAt clock.
+      const idleFor = now - (entry.lastActiveAt || 0)
+      const streamedIdleFor = entry.lastStreamedAt ? now - entry.lastStreamedAt : null
+      const reapable = idleFor > poolIdleMs() || (streamedIdleFor !== null && streamedIdleFor > POOL_PINNED_IDLE_MS)
+
+      if (reapable) {
+        const retiring = entry.process
+          ? poolRetirer.retireIdle(profile, poolIdleMs(), candidate =>
+              Boolean(
+                Date.now() - (candidate.lastActiveAt || 0) > poolIdleMs() ||
+                  (candidate.lastStreamedAt ? Date.now() - candidate.lastStreamedAt > POOL_PINNED_IDLE_MS : false)
+              )
+            )
+          : stopPoolBackend(profile)
 
         void retiring.catch(error => rememberLog(`Pool idle retirement failed: ${String(error)}`))
       }
@@ -12676,17 +12910,36 @@ function stopAttachedBackendMonitor() {
  * invalidates the connection and hands the respawn to the same supervisor path
  * a dead child would (which re-runs discovery and spawns, since the host now
  * has no backend).
+ *
+ * A backend recycled by an external supervisor (e.g. launchd `KeepAlive`)
+ * into a new process on the same port passes the readiness probe (it's a
+ * public route) while serving a brand-new session token, so also re-read the
+ * served token on every tick and treat drift the same as "gone" (#121988).
+ *
+ * This teardown is unexpected, not intentional (nobody asked for a re-home),
+ * so it must clear the slot via `backendConnectionState.invalidate()` directly
+ * rather than `invalidatePrimaryConnection()`: the latter also sets
+ * `primaryRecoverySuppressed`, which `scheduleUnexpectedPrimaryRecovery()`
+ * below would then read back as `intentionalTeardown` and refuse to claim,
+ * leaving the app with no backend and no respawn scheduled.
  */
 function startAttachedBackendMonitor(attached: AttachedBackend) {
   stopAttachedBackendMonitor()
 
   attachedBackendMonitor = setInterval(() => {
-    void waitForHermes(attached.baseUrl, attached.token, undefined, 'token', {}, { alreadyBound: true }).catch(() => {
-      stopAttachedBackendMonitor()
-      rememberLog(`[attach] attached backend on ${attached.baseUrl} (pid ${attached.pid}) is gone; recovering`)
-      invalidatePrimaryConnection()
-      scheduleUnexpectedPrimaryRecovery({ error: 'The Hermes backend this app attached to exited.', ready: true })
-    })
+    void waitForHermes(attached.baseUrl, attached.token, undefined, 'token', {})
+      .then(() => resolveServedDashboardToken(attached.baseUrl, attached.token).catch(() => attached.token))
+      .then(servedToken => {
+        if (isAttachedBackendTokenDrifted({ servedToken, adoptedToken: attached.token })) {
+          throw new Error('attached backend is serving a different session token')
+        }
+      })
+      .catch(() => {
+        stopAttachedBackendMonitor()
+        rememberLog(`[attach] attached backend on ${attached.baseUrl} (pid ${attached.pid}) is gone; recovering`)
+        backendConnectionState.invalidate()
+        scheduleUnexpectedPrimaryRecovery({ error: 'The Hermes backend this app attached to exited.', ready: true })
+      })
   }, ATTACHED_LIVENESS_POLL_MS)
 
   attachedBackendMonitor.unref?.()
@@ -13420,6 +13673,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     const message = error instanceof Error ? error.message : String(error)
     const hostKeyChanged = isHostKeyChangedBootFailure(error)
     const sshAuthFailed = isSshAuthFailedBootFailure(error)
+    const sshClientFailed = isSshClientFailedBootFailure(error)
 
     // Carry structured Cloud-down metadata through the boot-progress / IPC
     // boundary when present, so the renderer overlay can key on it rather than
@@ -13461,6 +13715,14 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
       backendStartFailure = error instanceof Error ? error : new Error(message)
     }
 
+    // A dead local ssh client (`ssh -G` failed) is terminal too (#103288):
+    // every retry re-runs the same local probe, so boot looped every ~2s and
+    // the user never reached Settings. Latch it so the overlay holds still;
+    // reset/repair/apply-config release it (desktop.ssh_path needs a restart).
+    if (shouldLatchSshClientFailure({ attemptedRemote, isReauth: false, isSshClientFailed: sshClientFailed })) {
+      backendStartFailure = error instanceof Error ? error : new Error(message)
+    }
+
     // A confirmed reauth rejection latches separately: it can't self-heal, and
     // leaving it unlatched hides the overlay's "Sign in" button on every retry.
     if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
@@ -13483,7 +13745,8 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
           attemptedRemote,
           isReauth: isReauthRequiredError(error),
           isHostKeyChanged: hostKeyChanged,
-          isSshAuthFailed: sshAuthFailed
+          isSshAuthFailed: sshAuthFailed,
+          isSshClientFailed: sshClientFailed
         }),
         running: false,
         statusCode: Number.isInteger(statusCode) ? statusCode : undefined
@@ -13660,11 +13923,18 @@ function focusWindow(win) {
     win.restore()
   }
 
-  if (!win.isVisible()) {
-    win.show()
+  // #83998: show() and focus() both seize the Windows OS foreground,
+  // dismissing other apps' native save/confirm dialogs while Hermes streams
+  // in the background. Reveal without activation, and only take the keyboard
+  // when the window doesn't already have focus — a redundant focus() still
+  // pumps SetForegroundWindow.
+  if (revealAction(win.isVisible()) === 'showInactive') {
+    win.showInactive()
   }
 
-  win.focus()
+  if (shouldFocusToTakeKeyboard(win)) {
+    win.focus()
+  }
 }
 
 function spawnSecondaryWindow({
@@ -15038,6 +15308,24 @@ function createWindow() {
       // window is on screen (a STARTING gnome-shell app must not see its entry change).
       notifyLauncherWindowRevealed()
 
+      // #124255: the first revealed window means the GPU survived this boot.
+      // Keep a sticky SwiftShader marker when we launched with the fallback;
+      // otherwise mark the probe healthy so future launches trust hardware GL.
+      if (NVIDIA_DRIVER_MAJOR !== null) {
+        try {
+          writeNvidiaEglMarker(
+            app.getPath('userData'),
+            nvidiaEglMarkerAfterSuccessfulBoot({
+              fallbackActive: nvidiaEglFallbackActive,
+              appVersion: app.getVersion(),
+              driverVersion: NVIDIA_DRIVER_VERSION
+            })
+          )
+        } catch {
+          void 0
+        }
+      }
+
       // #38216: clear the mid-boot marker only after a window is actually usable.
       // Keep sticky `fallback` when we launched with --no-sandbox so the next
       // Start Menu click does not re-enter the GPU FATAL crash loop. The marker
@@ -15478,7 +15766,7 @@ function revalidatePool() {
     log: rememberLog,
     probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
     stopBackend: stopPoolBackend,
-    tracker: remoteLiveness
+    tracker: pooledRemoteLiveness
   })
 }
 
@@ -15886,10 +16174,7 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
     throw new Error('SSH host is required.')
   }
 
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
+  const ssh = desktopSshBinary()
 
   return new Promise((resolve, reject) => {
     const child = spawn(ssh, ['-G', '--', value], hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'pipe'] }))
@@ -16151,7 +16436,7 @@ async function probeSshProfileInventory(connection) {
 
   const ssh = createSshProbeConnection(
     { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-    { rememberLog: sshRememberLog }
+    { rememberLog: sshRememberLog, sshBinary: desktopSshBinary() }
   )
 
   try {
@@ -16469,18 +16754,20 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
     Array.isArray((payload as any)?.excludeIds) ? (payload as any).excludeIds.map((id: unknown) => String(id)) : []
   )
 
-  const results = await Promise.all(
-    registry.connections
-      .filter(connection => !excludeIds.has(connection.id))
-      .map(async connection => {
-        const base = { connectionId: connection.id, label: connection.label, kind: connection.kind }
-        const eligibility = updateEligibility(connection)
+  // Remote entries settle before the local handoff runs: the local updater
+  // waits on the window PID exiting, so a still-running managed SSH update
+  // would eat into (or outlive) that deadline. Order of results is preserved.
+  const results = await updateConnectionsBeforeLocal(
+    registry.connections.filter(connection => !excludeIds.has(connection.id)),
+    async (connection: RegistryConnection) => {
+      const base = { connectionId: connection.id, label: connection.label, kind: connection.kind }
+      const eligibility = updateEligibility(connection)
 
-        if (!eligibility.eligible) {
+      if (!eligibility.eligible) {
           return { ...base, ok: false, skipped: true, reason: eligibility.reason }
-        }
+      }
 
-        try {
+      try {
           if (connection.kind === 'local') {
             // The app-managed runtime updates through the same pipeline as the
             // Settings → Updates button (marker + venv gate + relaunch flow).
@@ -16514,10 +16801,10 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
           }
 
           return { ...base, ok: true, detail: body?.message || 'update started' }
-        } catch (error: any) {
-          return { ...base, ok: false, error: String(error?.message || error) }
-        }
-      })
+      } catch (error: any) {
+        return { ...base, ok: false, error: String(error?.message || error) }
+      }
+    }
   )
 
   return { ok: true, results }
@@ -18297,6 +18584,7 @@ const terminalIpc = registerTerminalIpc({
   findOnPath,
   rememberLog,
   activeSshTerminalTarget,
+  sshBinary: desktopSshBinary,
   ensureBackend: webContentsId => ensureTerminalBackend(webContentsId),
   getSshConnectionState: scope => sshConnections.get(scope)
 })
@@ -18847,7 +19135,12 @@ function handleDeepLink(url) {
       mainWindow.restore()
     }
 
-    mainWindow.focus()
+    // #83998: a deep link must deliver without re-pumping the Windows
+    // foreground when the window already has focus.
+    if (shouldFocusToTakeKeyboard(mainWindow)) {
+      mainWindow.focus()
+    }
+
     mainWindow.webContents.send('hermes:deep-link', payload)
     rememberLog(`[deeplink] delivered ${kind}/${name}`)
   } catch (err) {
