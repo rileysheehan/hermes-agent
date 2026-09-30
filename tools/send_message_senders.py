@@ -256,8 +256,13 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
-    """One-shot Telegram Bot API send; parse failures fall back to plain text."""
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
+                         disable_notification=None):
+    """One-shot Telegram Bot API send; parse failures fall back to plain text.
+
+    ``disable_notification``: None leaves the Bot API default (the recipient is notified); True/False is sent
+    explicitly on every text chunk and media upload (Bot API: "Sends the message silently. Users will receive
+    a notification with no sound."). Whether a phone then shows a banner is the client's business."""
     try:
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
@@ -267,7 +272,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
-        thread_kwargs = _telegram_thread_kwargs(thread_id)
+        # Per-message notification choice rides on text AND media sends (both accept disable_notification).
+        thread_kwargs = {**_telegram_thread_kwargs(thread_id),
+                         **({} if disable_notification is None else {"disable_notification": bool(disable_notification)})}
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
         last_msg, warnings, _tg_caption = None, [], None

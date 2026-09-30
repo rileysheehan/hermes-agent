@@ -615,18 +615,24 @@ class GatewayBusySessionMixin:
             return reply_anchor if event.source.chat_type == "dm" else None
         return None if getattr(event, "internal", False) else event.message_id
 
-    async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
+    async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False,
+                               notify: Optional[bool] = None) -> None:
         """Send a busy-path reply anchored to the event (thread metadata included). Never to a bot:
-        an ack, redirect or drain notice is a new inbound message for its turn loop (#137027)."""
+        an ack, redirect or drain notice is a new inbound message for its turn loop (#137027).
+        ``notify=False`` marks an automatic acknowledgment silent wherever the adapter honours it
+        (Telegram: disable_notification), whatever the platform's notification mode."""
         from gateway.bot_peer_notices import automatic_notices_allowed
         if not automatic_notices_allowed(event.source):
             logger.debug("Busy-path notice suppressed for bot-authored message in %s", event.source.chat_id)
             return
         reply_anchor = self._reply_anchor_for_event(event)
+        metadata = self._thread_metadata_for_source(event.source, reply_anchor)
+        if notify is not None:
+            metadata = {**(metadata or {}), "notify": notify}
         await adapter._send_with_retry(
             chat_id=event.source.chat_id, content=content,
             reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
-            metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            metadata=metadata,
         )
 
     async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
@@ -639,7 +645,7 @@ class GatewayBusySessionMixin:
             message = t("gateway.busy.drain_queued", action=self._status_action_gerund())
         else:
             message = t("gateway.busy.drain_rejected", action=self._status_action_gerund())
-        await self._send_busy_reply(event, adapter, message)
+        await self._send_busy_reply(event, adapter, message, notify=False)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command. English words
     # (and the thumbs) always match; ``approval.inputs.*`` adds the active language's synonyms.
@@ -928,7 +934,7 @@ class GatewayBusySessionMixin:
 
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
-            await self._send_busy_reply(event, adapter, message)
+            await self._send_busy_reply(event, adapter, message, notify=False)
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
