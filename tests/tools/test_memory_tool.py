@@ -958,3 +958,87 @@ class TestBackgroundReviewDeleteGate:
             reset_current_write_origin(token)
         assert result["success"] is True
         assert "rewritten by refine" in store._entries_for("memory")
+
+
+class TestUnattendedConsolidationApply:
+    """``auxiliary.background_review.unattended_memory_consolidation: apply``: an unattended review
+    applies its own replace/remove (installs with no one at a prompt to approve them), and every
+    entry it overwrites or removes is archived to ``memories/consolidated.jsonl`` first."""
+
+    @pytest.fixture(autouse=True)
+    def _apply_mode(self, monkeypatch, tmp_path):
+        import tools.memory_tool as mt
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self.mode = "apply"
+        monkeypatch.setattr(mt, "unattended_consolidation_mode", lambda: self.mode)
+        self.archive = tmp_path / "consolidated.jsonl"  # the store fixture puts memories in tmp_path
+
+    def _as_review(self, **kw):
+        token = set_current_write_origin("background_review")
+        try:
+            return json.loads(memory_tool(**kw))
+        finally:
+            reset_current_write_origin(token)
+
+    def _rows(self):
+        return [json.loads(line) for line in self.archive.read_text().splitlines()]
+
+    def test_batch_applies_and_archives_each_full_entry(self, store):
+        store.add("memory", "old rule about the scan script taking paths")
+        store.add("memory", "duplicate rule about the scan script")
+        result = self._as_review(store=store, operations=[
+            {"action": "remove", "old_text": "duplicate rule"},
+            {"action": "replace", "old_text": "old rule about", "content": "scan script: pass repo paths"},
+            {"action": "add", "content": "a new fact"},
+        ])
+        assert result["success"] is True and not result.get("staged")
+        entries = store._entries_for("memory")
+        assert entries == ["scan script: pass repo paths", "a new fact"]
+        rows = self._rows()
+        assert [(r["action"], r["entry"]) for r in rows] == [
+            ("remove", "duplicate rule about the scan script"),
+            ("replace", "old rule about the scan script taking paths")]
+        assert rows[1]["replacement"] == "scan script: pass repo paths"
+        assert rows[0]["origin"] == "background_review"
+        from tools.write_approval import MEMORY, list_pending
+        assert list_pending(MEMORY) == []
+
+    def test_unmatched_old_text_is_an_error_and_archives_nothing(self, store):
+        store.add("memory", "only entry")
+        result = self._as_review(store=store, action="remove", old_text="not there")
+        assert result["success"] is False
+        assert store._entries_for("memory") == ["only entry"]
+        assert not self.archive.exists()
+
+    def test_archive_failure_falls_back_to_staging(self, store, monkeypatch):
+        import tools.memory_tool as mt
+        store.add("memory", "keep me unless archived")
+        monkeypatch.setattr(mt, "consolidation_archive_path", lambda: Path("/dev/null/nope/consolidated.jsonl"))
+        result = self._as_review(store=store, action="remove", old_text="keep me")
+        assert result["staged"] is True
+        assert store._entries_for("memory") == ["keep me unless archived"]
+
+    def test_stage_mode_unchanged(self, store):
+        self.mode = "stage"
+        store.add("memory", "rule one")
+        result = self._as_review(store=store, action="remove", old_text="rule one")
+        assert result["staged"] is True
+        assert store._entries_for("memory") == ["rule one"]
+        assert not self.archive.exists()
+
+    def test_foreground_does_not_archive(self, store):
+        store.add("memory", "foreground removes this")
+        result = json.loads(memory_tool(action="remove", old_text="foreground removes", store=store))
+        assert result["success"] is True
+        assert not self.archive.exists()
+
+
+def test_unattended_consolidation_mode_reads_config(monkeypatch):
+    import hermes_cli.config as cfg
+    from tools.memory_tool import unattended_consolidation_mode
+    for value, expected in (("apply", "apply"), ("APPLY ", "apply"), ("stage", "stage"), ("bogus", "stage"), (None, "stage")):
+        monkeypatch.setattr(cfg, "load_config_readonly",
+                            lambda v=value: {"auxiliary": {"background_review": {"unattended_memory_consolidation": v}}})
+        assert unattended_consolidation_mode() == expected, value
+    monkeypatch.setattr(cfg, "load_config_readonly", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert unattended_consolidation_mode() == "stage"
