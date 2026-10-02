@@ -816,8 +816,12 @@ DEFAULT_CONFIG = {
         # reviews memory after a substantive one-shot turn (oneshot_min_tool_calls, default = the
         # skill nudge interval) for installs that resume one session per run. focus (default unset) is
         # a standing instruction appended to every AUTOMATIC review (/refine's own focus wins).
+        # unattended_memory_consolidation: "stage" (default) holds an unattended review's memory
+        # replace/remove for /memory pending (#105921); "apply" lets it consolidate directly and
+        # archives each overwritten/removed entry to memories/consolidated.jsonl first, for installs
+        # where nobody is at a prompt to approve (a full store otherwise refuses every new add).
         "background_review": {"enabled": True, "linger_timeout_s": 240, "oneshot_learning": False,
-                              "focus": "", **_aux(120)},
+                              "focus": "", "unattended_memory_consolidation": "stage", **_aux(120)},
         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
