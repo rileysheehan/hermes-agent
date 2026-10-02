@@ -820,8 +820,13 @@ DEFAULT_CONFIG = {
         # replace/remove for /memory pending (#105921); "apply" lets it consolidate directly and
         # archives each overwritten/removed entry to memories/consolidated.jsonl first, for installs
         # where nobody is at a prompt to approve (a full store otherwise refuses every new add).
+        # carry_owed_reviews (default false): a review that was due but did not finish (killed,
+        # cancelled, interrupted) stays owed in <home>/review_owed/ and is paid by the session's next
+        # turn, or by the next one-shot run of the profile at exit; short one-shot turns add their tool
+        # calls up toward oneshot_min_tool_calls.
         "background_review": {"enabled": True, "linger_timeout_s": 240, "oneshot_learning": False,
-                              "focus": "", "unattended_memory_consolidation": "stage", **_aux(120)},
+                              "focus": "", "unattended_memory_consolidation": "stage",
+                              "carry_owed_reviews": False, **_aux(120)},
         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),

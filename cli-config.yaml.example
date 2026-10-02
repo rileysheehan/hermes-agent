@@ -995,6 +995,9 @@ prompt_caching:
 #                              # substantive run (for orchestrators that resume one session per task)
 #     oneshot_min_tool_calls: 10  # "substantive" (default: the skill nudge interval)
 #     focus: ""                # standing instruction for every automatic review (/refine's focus wins)
+#     carry_owed_reviews: false  # true: a review that was due but cut off (killed, cancelled, interrupted)
+#                              # stays owed and is paid by the session's next turn or the profile's next
+#                              # one-shot run; short one-shot turns add up to oneshot_min_tool_calls
 
 # =============================================================================
 # Persistent Memory

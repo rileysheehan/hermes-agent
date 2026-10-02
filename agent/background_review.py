@@ -34,6 +34,9 @@ class _BackgroundReviewRun:
         self._lock = threading.Lock()
         self._review_agent = None
         self._request_finished = self._cancel_dispatched = False
+        # carry_owed_reviews: the owed-review marker this run settles when its fork finishes.
+        self.owed_session: Optional[str] = None
+        self.owed_token: Optional[str] = None
 
     def begin_request(self, review_agent: Any) -> bool:
         """Atomically admit the first provider-capable review phase."""
@@ -285,6 +288,65 @@ def drain_background_review(agent: Any, *, timeout: Optional[float] = None) -> b
         logger.warning(
             "Background review still running %.0fs after exit began — abandoning it; "
             "raise auxiliary.background_review.linger_timeout_s to let it finish", budget)
+    return bool(finished)
+
+
+# An owed review taken over at exit needs a prefill plus a few tool turns; below this much of the linger
+# budget left, starting one would only be abandoned half-way (and paid for).
+_OWED_MIN_BUDGET_S = 60.0
+
+
+def drain_owed_review(agent: Any, *, budget: float) -> bool:
+    """``carry_owed_reviews``: at one-shot exit, review ONE other session of this profile whose review
+    was owed and whose process is gone (killed, cancelled, or never resumed), from its transcript in
+    ``state.db``, inside what is left of the exit-linger budget. Returns True when it finished."""
+    if agent is None or budget < _OWED_MIN_BUDGET_S:
+        return False
+    from agent import owed_review
+
+    enabled, task_cfg = load_background_review_settings()
+    if not enabled or not owed_review.applies(agent, task_cfg):
+        return False
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        return False
+    marker = owed_review.claim_orphan(exclude=getattr(agent, "session_id", None))
+    if not marker:
+        return False
+    session, token = marker.get("session_id"), marker.get("token")
+    tools = getattr(agent, "valid_tool_names", set()) or set()
+    review_memory = bool(marker.get("memory")) and "memory" in tools and bool(getattr(agent, "_memory_store", None))
+    review_skills = bool(marker.get("skills")) and "skill_manage" in tools
+    try:
+        messages = [m for m in (db.get_messages_as_conversation(session, repair_alternation=True) or [])
+                    if m.get("role") != "session_meta"]
+    except Exception:  # noqa: BLE001
+        logger.warning("Owed review for session %s: transcript unreadable; left owed", session, exc_info=True)
+        owed_review.release(session, token)
+        return False
+    if not messages:
+        # The session was pruned or never persisted: there is nothing left to review.
+        logger.info("Owed review for session %s: no transcript left; settling it", session)
+        owed_review.settle(session, token)
+        return False
+    if not (review_memory or review_skills):
+        owed_review.release(session, token)
+        return False
+    from agent.turn_finalizer import _clone_background_review_messages
+
+    agent._spawn_background_review_now(
+        messages_snapshot=_clone_background_review_messages(messages), review_memory=review_memory,
+        review_skills=review_skills, task_cfg=task_cfg, owed_session=session, owed_token=token)
+    run = getattr(agent, "_background_review_run", None)
+    done = getattr(run, "request_done", None)
+    if done is None or getattr(run, "owed_token", None) != token:
+        # Not admitted (a review is still in flight): hand the claim back for the next run.
+        owed_review.release(session, token)
+        return False
+    logger.info("One-shot exit: reviewing owed session %s (memory=%s skills=%s)", session, review_memory, review_skills)
+    finished = done.wait(budget)
+    if not finished:
+        logger.warning("Owed review of session %s still running after %.0fs; left owed", session, budget)
     return bool(finished)
 
 
@@ -1260,6 +1322,9 @@ class _ReviewForkState:
     review_agent: Any = None
     review_messages: List[Dict] = field(default_factory=list)
     review_usage: Dict[str, Any] = field(default_factory=dict)
+    # The fork's conversation returned without being interrupted, cancelled or failing: an owed-review
+    # marker (``carry_owed_reviews``) is settled only then.
+    finished: bool = False
 
 
 def _release_fork_clients(review_agent: Any) -> None:
@@ -1308,7 +1373,7 @@ def _run_review_fork(
     try:
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
-            st.review_agent.run_conversation(
+            _result = st.review_agent.run_conversation(
                 user_message=(
                     prompt + "\n\nYou can only call " + memory_phrase_prompt +
                     "management tools. Other tools will be denied "
@@ -1316,6 +1381,13 @@ def _run_review_fork(
                 ),
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
+            _res = _result if isinstance(_result, dict) else {}
+            st.finished = not (_res.get("interrupted") or _res.get("failed") or (
+                review_run is not None and review_run.cancel_requested.is_set()))
+            if st.finished:
+                # Before request_done is published (finally below): the exit linger stops waiting
+                # on that event, and the process may end right after it.
+                _settle_owed_review(review_run)
     finally:
         clear_thread_tool_whitelist()
         # Attribute usage to the PARENT session. Snapshot BEFORE unregister/close so counters
@@ -1331,6 +1403,16 @@ def _run_review_fork(
     st.review_messages = list(getattr(st.review_agent, "_session_messages", []))
     _release_fork_clients(st.review_agent)
     st.review_agent = None
+
+
+def _settle_owed_review(review_run: Optional[_BackgroundReviewRun]) -> None:
+    """``carry_owed_reviews``: this review finished, so the session no longer owes it."""
+    session, token = getattr(review_run, "owed_session", None), getattr(review_run, "owed_token", None)
+    if session and token:
+        with suppress(Exception):
+            from agent import owed_review
+
+            owed_review.settle(session, token)
 
 
 def _publish_review_summary(agent: Any, actions: List[str]) -> None:
