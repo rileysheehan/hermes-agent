@@ -7,6 +7,7 @@ Single `memory` tool: add/replace/remove or a batch `operations` list."""
 import copy
 import json
 import logging
+import os
 from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -180,21 +181,34 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
         return None
-    detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
-              else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
+    if unattended_consolidation_mode() == "apply":
+        # Opt-in: the review applies its own consolidation, and every entry it overwrites or
+        # removes is archived first (memories/consolidated.jsonl), so nothing is lost unrecorded.
+        return _archive_before_consolidation(store, payload)
+    return _stage_consolidation(store, payload)
+
+
+def _stage_consolidation(store, payload: Dict[str, Any]) -> Optional[str]:
+    """Stage an unattended review's replace/remove for ``/memory pending`` (#105921)."""
+    is_batch = payload.get("action") == "batch"
+    operations = payload.get("operations") if is_batch else None
+    target, action = payload.get("target", "memory"), payload.get("action")
+    detail = ("; ".join(_batch_op_line(op) for op in operations) if is_batch
+              else _batch_op_line({"action": action, "content": payload.get("content"),
+                                   "old_text": payload.get("old_text")}))
     try:
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched
         from tools import write_approval as wa
         record = wa.stage_write(
             wa.MEMORY, payload,
-            summary=(f"background review consolidation ({'batch' if operations is not None else action} "
+            summary=(f"background review consolidation ({'batch' if is_batch else action} "
                      f"on {target}): {detail}")[:200],
             origin=wa.current_origin())
         return json.dumps({
             "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
             "message": ("Background review may not delete memory entries unattended. The proposed "
-                        f"{'batch' if operations is not None else action} was staged for your approval — "
+                        f"{'batch' if is_batch else action} was staged for your approval — "
                         "review it with /memory pending (approve to apply, discard to drop)."),
         }, ensure_ascii=False)
     except Exception:
@@ -202,6 +216,56 @@ def _background_delete_gate(store, action, operations, target="memory", content=
         return tool_error(
             "Background review may not delete memory entries ('replace'/'remove', including in a "
             "batch); 'add' is still available.", success=False)
+
+
+_CONSOLIDATION_MODES = ("stage", "apply")
+
+
+def unattended_consolidation_mode() -> str:
+    """``auxiliary.background_review.unattended_memory_consolidation``: ``stage`` (default, the
+    #105921 behaviour: replace/remove from an unattended review wait in ``/memory pending``) or
+    ``apply`` (the review consolidates directly; each overwritten/removed entry is archived first).
+    For installs where no one is at a prompt to approve: staged proposals there are never applied,
+    and a store at its limit then refuses every new ``add``. Unknown values fall back to ``stage``."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        block = ((load_config_readonly() or {}).get("auxiliary") or {}).get("background_review") or {}
+        mode = str(block.get("unattended_memory_consolidation") or "stage").strip().lower()
+    except Exception:
+        return "stage"
+    return mode if mode in _CONSOLIDATION_MODES else "stage"
+
+
+def consolidation_archive_path() -> Path:
+    return get_memory_dir() / "consolidated.jsonl"
+
+
+def _archive_before_consolidation(store, payload: Dict[str, Any]) -> Optional[str]:
+    """Pin and archive the FULL entry each replace/remove selects now, then let the write proceed
+    (None). Fails closed to the staging path if the search fails or the archive cannot be written:
+    an entry is never overwritten without its record."""
+    if (unmatched := _pin_matched_entries(store, payload)) is not None:
+        return unmatched
+    import time
+    from tools.skill_provenance import get_current_write_origin
+    rows = [{"ts": time.time(), "target": payload.get("target", "memory"), "action": op["action"],
+             "entry": op.get("matched_entry"), "replacement": op.get("content") if op["action"] == "replace" else None,
+             "origin": get_current_write_origin()}
+            for op in destructive_ops(payload)]
+    try:
+        path = consolidation_archive_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        logger.warning("Could not archive unattended memory consolidation; staging it instead", exc_info=True)
+        return _stage_consolidation(store, payload)
+    logger.info("Unattended review consolidated %d memory entr%s (archived to %s)",
+                len(rows), "y" if len(rows) == 1 else "ies", path)
+    return None
 
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
