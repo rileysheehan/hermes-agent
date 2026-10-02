@@ -515,11 +515,15 @@ def _linger_for_background_review() -> None:
     agent = _active_agent_ref
     if agent is None:
         return
-    from agent.background_review import drain_background_review
+    from agent.background_review import drain_background_review, drain_owed_review, drain_timeout_s
 
+    started = time.monotonic()
     if drain_background_review(agent):
         logger.info("One-shot exit linger: background review completed (session=%s)",
                     getattr(agent, "session_id", None) or "<unknown>")
+    # carry_owed_reviews: with what is left of the budget, pay one review another session still owes.
+    if drain_owed_review(agent, budget=drain_timeout_s() - (time.monotonic() - started)):
+        logger.info("One-shot exit linger: owed review completed")
 
 
 def _run_cleanup(*, notify_session_finalize: bool = True):

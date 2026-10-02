@@ -773,6 +773,13 @@ def finalize_turn(
     # ``auxiliary.background_review.oneshot_learning``; it only fires for a SUBSTANTIVE turn
     # (``oneshot_min_tool_calls`` tool calls, default: the skill nudge interval) so a
     # trivial probe costs nothing. ``skip_background_review`` (cron) still wins.
+    # With ``carry_owed_reviews`` the session's earlier short turns count toward that threshold.
+    _owed_session = _owed_turn_calls = None
+    with suppress(Exception):
+        from agent import owed_review
+
+        if owed_review.applies(agent):
+            _owed_session = agent.session_id
     if (
         not _should_review_memory
         and not getattr(agent, "skip_background_review", False)
@@ -780,9 +787,38 @@ def finalize_turn(
         and getattr(agent, "_memory_store", None)
     ):
         with suppress(Exception):
+            from agent import owed_review
             from agent.background_review import oneshot_memory_review_due, turn_tool_call_count
 
-            _should_review_memory = oneshot_memory_review_due(agent, turn_tool_call_count(messages))
+            _owed_turn_calls = turn_tool_call_count(messages)
+            _carried = owed_review.carried_tool_calls(_owed_session) if _owed_session else 0
+            _should_review_memory = oneshot_memory_review_due(agent, _owed_turn_calls + _carried)
+
+    # ``carry_owed_reviews``: a review owed by an earlier turn of this session (killed, cancelled or
+    # interrupted before it finished) is folded into this turn's review, whose snapshot is the whole
+    # conversation. The marker is written BEFORE the review spawns and removed only when it finishes,
+    # so a review that dies with the process is still owed. Best-effort: never breaks the turn.
+    _owed_token = None
+    if _owed_session:
+        with suppress(Exception):
+            from agent import owed_review
+
+            _owed_memory, _owed_skills = owed_review.owed_kinds(_owed_session)
+            _should_review_memory = bool(_should_review_memory or (
+                _owed_memory and "memory" in getattr(agent, "valid_tool_names", set())
+                and getattr(agent, "_memory_store", None)))
+            _should_review_skills = bool(_should_review_skills or (
+                _owed_skills and "skill_manage" in getattr(agent, "valid_tool_names", set())))
+            _spawning = bool(final_response and not interrupted)
+            if _should_review_memory or _should_review_skills:
+                _owed_token = owed_review.mark_owed(
+                    _owed_session, memory=_should_review_memory, skills=_should_review_skills,
+                    reason="review_started" if _spawning else "turn_interrupted", spawning=_spawning)
+            elif _owed_turn_calls:
+                from agent.oneshot_footprint import oneshot_learning
+
+                if oneshot_learning():
+                    owed_review.carry(_owed_session, _owed_turn_calls)
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
@@ -795,9 +831,10 @@ def finalize_turn(
         and (_should_review_memory or _should_review_skills)
     ):
         with suppress(Exception):
+            _owed_kwargs = dict(owed_session=_owed_session, owed_token=_owed_token) if _owed_token else {}
             agent._spawn_background_review(
                 messages_snapshot=list(messages), review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_skills=_should_review_skills, **_owed_kwargs,
             )
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:

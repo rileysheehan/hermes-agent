@@ -786,12 +786,15 @@ class AIAgent(
     _summarize_background_review_actions = _forward_static("agent.background_review", "summarize_background_review_actions")
 
     def _spawn_background_review(self, messages_snapshot: List[Dict], review_memory: bool = False,
-                                 review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False) -> None:
+                                 review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False,
+                                 owed_session: Optional[str] = None, owed_token: Optional[str] = None) -> None:
         """Post-turn review entry point: decide WHEN, then spawn.
 
         A review whose runtime is the MANAGED LOCAL llama-server is queued for machine idle (``defer: auto``)
         instead of hitting the user's GPU mid-session; everything else spawns immediately. ``explicit``
         (/refine) is never deferred but does not touch the ``focus``-keyed delegate/enabled gates.
+        ``owed_session``/``owed_token`` (``carry_owed_reviews``) name the owed-review marker this review
+        settles when it finishes (see agent/owed_review.py).
         """
         # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
@@ -811,6 +814,8 @@ class AIAgent(
         kwargs = dict(messages_snapshot=_clone_background_review_messages(messages_snapshot),
                       review_memory=review_memory, review_skills=review_skills, focus=focus, task_cfg=task_cfg,
                       explicit=explicit)
+        if owed_token:
+            kwargs.update(owed_session=owed_session, owed_token=owed_token)
         if focus is None and not explicit and _review_should_defer(self, task_cfg):
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
@@ -820,7 +825,8 @@ class AIAgent(
     def _spawn_background_review_now(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                      review_skills: bool = False, focus: Optional[str] = None,
                                      task_cfg: Optional[Dict[str, Any]] = None, _requeue_attempts: int = 0,
-                                     explicit: bool = False) -> None:
+                                     explicit: bool = False, owed_session: Optional[str] = None,
+                                     owed_token: Optional[str] = None) -> None:
         """Spawn the background memory/skill review thread.
 
         ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
@@ -837,6 +843,8 @@ class AIAgent(
         review_run = prepare_background_review_run(self)
         if review_run is None:
             return
+        # Settled by _run_review_in_thread only when the fork returns un-interrupted.
+        review_run.owed_session, review_run.owed_token = owed_session, owed_token
         try:
             target, _prompt = spawn_background_review_thread(
                 self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
@@ -848,7 +856,8 @@ class AIAgent(
                 self._maybe_requeue_preempted_review(review_run, dict(
                     messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
                     focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1,
-                    explicit=explicit))
+                    explicit=explicit, **(dict(owed_session=owed_session, owed_token=owed_token)
+                                       if owed_token else {})))
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile.

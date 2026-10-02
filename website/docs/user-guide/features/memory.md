@@ -486,6 +486,37 @@ auxiliary:
     linger_timeout_s: 240
 ```
 
+#### Owed reviews (`carry_owed_reviews`)
+
+A review can still be lost: the process is killed or cancelled before the fork
+returns, a new message interrupts it, or the turn itself is interrupted while a
+review was due. And a run below `oneshot_min_tool_calls` is never reviewed, even
+when several short runs of one session add up to real work. Opt in to carry them:
+
+```yaml
+auxiliary:
+  background_review:
+    carry_owed_reviews: true
+```
+
+- Before a review spawns, Hermes writes a small marker,
+  `<HERMES_HOME>/review_owed/<session_id>.json`, and removes it only when the
+  review's conversation returns without being interrupted. A marker left behind
+  means the review is **owed**.
+- The session's next turn folds the owed review into its own post-turn review.
+  That review replays the whole conversation, so it covers the turns the lost
+  review missed.
+- A session that is never resumed is paid by the next one-shot run of the same
+  profile: at exit, inside what is left of `linger_timeout_s` (at least 60 s), it
+  reviews one owed session from its transcript in `state.db`, oldest first. It
+  only takes a marker whose writing process is gone, or which is over 2 hours old.
+- With `oneshot_learning`, a one-shot turn below `oneshot_min_tool_calls` adds its
+  tool calls to the session's count, and the session's first turn that reaches
+  the threshold is reviewed.
+- After 3 attempts an owed review is no longer retried; its marker stays. An owed
+  marker older than a day means learning has stopped for that session, which makes
+  it a good thing to monitor.
+
 ### Local models: reviews wait for an idle GPU (`defer`)
 
 On a cloud provider the review finishes in seconds and runs alongside

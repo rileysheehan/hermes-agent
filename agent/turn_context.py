@@ -735,6 +735,13 @@ def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]])
                 logger.debug(
                     "restored native checkpoint hydration skipped", exc_info=True
                 )
+        # carry_owed_reviews: this process now owns the session, so its own post-turn review pays
+        # any review the session still owes; stamp the marker so no other run takes it over.
+        with suppress(Exception):
+            from agent import owed_review
+
+            if owed_review.applies(agent):
+                owed_review.touch(agent.session_id)
         # Hydrate per-session nudge counters from persisted history.
         prior_user_turns = sum(1 for m in conversation_history if m.get("role") == "user")
         if prior_user_turns > 0:
