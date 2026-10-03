@@ -999,6 +999,10 @@ gateway:
       Pour augmenter la limite, définissez agent.gateway_timeout dans config.yaml (valeur en secondes, 0 = aucune limite) et redémarrez le gateway.
       Réessayez, ou utilisez /reset pour repartir de zéro.
     working_heartbeat: "⏳ En cours — {minutes} min{detail}"
+    working_heartbeat_completed: "✓ Finished after {minutes} min."
+    working_heartbeat_interrupted: "⏹ Interrupted after {minutes} min."
+    working_heartbeat_failed: "⚠️ Stopped after {minutes} min without finishing."
+    working_heartbeat_restarted: "⏹ Stopped after {minutes} min: the gateway restarted before this finished."
     thinking_prefix: "💬 {text}"
     tool_head: "{emoji} {tool}"
     tool_verbose: |-
