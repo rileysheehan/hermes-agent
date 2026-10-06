@@ -1338,7 +1338,8 @@ DEFAULT_CONFIG = {
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
-        # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
+        # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("honcho",
+        # "hindsight", "supermemory").
         "provider": "",
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
@@ -1537,8 +1538,8 @@ DEFAULT_CONFIG = {
             "keep": 2,  # retain last N regular snapshots
         },
     },
-    # Honcho AI-native memory — ~/.honcho/config.json is the source of truth (apiKey, workspace,
-    # peerName, sessions, enabled); hermes-specific overrides only here.
+    # Honcho memory plugin (plugin catalog) — ~/.honcho/config.json is the source of truth (apiKey,
+    # workspace, peerName, sessions, enabled); the plugin reads hermes-specific overrides from here.
     "honcho": {},
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
     "timezone": "",
@@ -1745,6 +1746,16 @@ DEFAULT_CONFIG = {
         # Opt-in unattended apply for the cadence check. Git-row plugins ONLY; every apply runs the
         # same security scan / consent pipeline as the manual update command.
         "auto_apply": False,
+        # Where third-party Python plugins run. in_process: imported into Hermes (default).
+        # host: one plugin-host process per profile runs them and they reach Hermes only through
+        # ctx (a crashing or hanging plugin takes down its host, which restarts; Hermes keeps
+        # running). Bundled plugins stay in-process; `hermes plugins validate` says whether a
+        # plugin can run in the host.
+        "isolation": "in_process",
+        "host": {
+            # argv prefix the plugin host runs under, e.g. a sandbox runner. [] = plain subprocess.
+            "launcher": [],
+        },
     },
     # Shell-script hooks: event name (pre_tool_call, post_tool_call, pre_llm_call, subagent_stop,
     # ...) -> list of {matcher, command, timeout}. First run of a new command prompts for consent;
