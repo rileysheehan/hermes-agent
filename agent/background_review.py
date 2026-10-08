@@ -1415,6 +1415,31 @@ def _settle_owed_review(review_run: Optional[_BackgroundReviewRun]) -> None:
             owed_review.settle(session, token)
 
 
+def _review_callback_text(actions: List[str]) -> str:
+    """Messaging/TUI form of a review summary. One change keeps the one-line form; several become a list, one
+    change per line, with a staged proposal marked as waiting rather than read as done, and the profile named
+    (the default profile is the agent the chat already is)."""
+    items = list(dict.fromkeys(actions))
+    if len(items) == 1:
+        return t("display.review.summary_callback", summary=items[0])
+    try:
+        from hermes_cli.profiles import current_profile_name
+        who = current_profile_name()
+    except Exception:
+        who = None
+    who = who.capitalize() if who and who != "default" else ""
+    staged = set(_staged_messages(items))
+    lines = [t("display.review.summary_list_item", item=t("display.review.staged_item" if a in staged else "display.review.applied_item", item=a))
+             for a in items]
+    head = t("display.review.summary_list_head_named", who=who) if who else t("display.review.summary_list_head")
+    return head + "\n" + "\n".join(lines)
+
+
+def _staged_messages(items: List[str]) -> List[str]:
+    """The summary lines that are staged proposals (``_action_lines`` returns their tool message verbatim)."""
+    return [a for a in items if "staged for your approval" in a]
+
+
 def _publish_review_summary(agent: Any, actions: List[str]) -> None:
     summary = " · ".join(dict.fromkeys(actions))
     # ``-Q`` promises stdout carries only the final response; with the one-shot exit linger the
@@ -1425,7 +1450,7 @@ def _publish_review_summary(agent: Any, actions: List[str]) -> None:
         agent._safe_print(t("display.review.summary_cli", summary=summary))
     if agent.background_review_callback:
         with suppress(Exception):
-            agent.background_review_callback(t("display.review.summary_callback", summary=summary))
+            agent.background_review_callback(_review_callback_text(actions))
 
 
 def _run_review_in_thread(
