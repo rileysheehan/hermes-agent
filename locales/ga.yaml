@@ -3575,6 +3575,11 @@ display:
       user: "Próifíl úsáideora"
     summary_cli: "  💾 Athbhreithniú féinfheabhsúcháin: {summary}"
     summary_callback: "💾 Athbhreithniú féinfheabhsúcháin: {summary}"
+    summary_list_head: "💾 Self-improvement review:"
+    summary_list_head_named: "💾 {who}'s self-improvement review:"
+    summary_list_item: "• {item}"
+    applied_item: "✅ {item}"
+    staged_item: "⏳ not applied yet: {item}"
     aux_failure_label: "athbhreithniú cúlra"
   notice:
     uncompressed_context_overflow: "⚠️ Sáraíonn comhthéacs an tseisiúin (~{tokens} comhartha) fuinneog chomhthéacs an mhúnla (~{context_length} comhartha) agus an comhbhrú díchumasaithe (compression.enabled: false). Úsáid /compact chun an stair a chomhbhrú nó cumasaigh an comhbhrú i config.yaml."
