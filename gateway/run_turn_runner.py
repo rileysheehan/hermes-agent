@@ -1032,16 +1032,27 @@ class TurnRunner:
 
     def _current_message_count(self):
         """Cross-process write guard input: the session's current DB message_count (or None)."""
+        return self._session_row_guard()[0]
+
+    def _session_row_guard(self):
+        """Cross-process guard inputs from ONE row read: ``(message_count, stored_prompt_cleared)``.
+
+        ``stored_prompt_cleared`` is True only for a row that has messages but no stored system
+        prompt. A gateway turn persists the prompt right after building it, so a continuing session
+        with a NULL prompt was cleared out of process (``hermes sessions repair-prompts --apply``,
+        whose contract is "the next turn rebuilds") or its persist failed (the null path rebuilds
+        every turn anyway). Unknown state reads as not cleared (fail-safe: reuse)."""
         ctx = self._ctx
         if self._runner._session_db is None or not ctx.session_id:
-            return None
-        count = None
+            return None, False
+        count, cleared = None, False
         with suppress(Exception):
             # run_sync is off-loop (executor); sync DB is fine.
             row = self._runner._session_db._db.get_session(ctx.session_id)
             if row:
                 count = row.get("message_count", 0)
-        return count
+                cleared = bool(count) and not row.get("system_prompt")
+        return count, cleared
 
     def _pop_cached_agent_for_eviction(self):
         """Evict under the lock but DEFER release (release_clients can block on memory-provider /
@@ -1052,7 +1063,8 @@ class TurnRunner:
         agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
         return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
 
-    def _lookup_cached_agent(self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count):
+    def _lookup_cached_agent(self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count,
+                             prompt_cleared=False):
         ctx = self._ctx
         out = self._CachedAgentLookup()
         if not (cache_lock and cache is not None):
@@ -1083,6 +1095,16 @@ class TurnRunner:
                     "Agent cache invalidated for session %s: "
                     "message_count changed (%s -> %s), "
                     "possible cross-process write", ctx.session_key, cached_mc, msg_count,
+                )
+            elif not sid_mismatch and prompt_cleared and getattr(cached[0], "_cached_system_prompt", None):
+                # The row's stored prompt was cleared while this agent still holds the old one in
+                # memory: reusing it would serve the old prompt until the idle TTL or a restart, and
+                # the clear would never take effect. Rebuild; the fresh agent finds the NULL row and
+                # builds (and persists) the current prompt from disk.
+                logger.info(
+                    "Agent cache invalidated for session %s: "
+                    "stored system prompt for %s was cleared out of process; "
+                    "rebuilding instead of serving the in-memory prompt", ctx.session_key, ctx.session_id,
                 )
             else:
                 out.agent = cached[0]
@@ -1152,8 +1174,10 @@ class TurnRunner:
         cache_lock = getattr(runner, "_agent_cache_lock", None)
         cache = getattr(runner, "_agent_cache", None)
         peek_sid, dead = self._cached_sid_is_dead(cache_lock, cache)
-        msg_count = self._current_message_count()
-        found = self._lookup_cached_agent(sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count)
+        msg_count, prompt_cleared = self._session_row_guard()
+        found = self._lookup_cached_agent(
+            sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count, prompt_cleared,
+        )
         agent = found.agent
         # Lock released — refresh the reused agent's fallback chain from disk OUTSIDE the cache lock
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
