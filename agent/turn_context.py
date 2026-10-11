@@ -1259,6 +1259,22 @@ def build_turn_context(
     active_system_prompt = compaction.active_system_prompt
     conversation_history = compaction.conversation_history
     current_turn_user_idx = compaction.current_turn_user_idx
+
+    # MER-646 (opt-in by the orchestrator's environment only): reference an unchanged leading instruction block
+    # instead of repeating it. Decided HERE, on the final canonical rows (after rotated-session recovery/adoption
+    # and turn-start compaction) and before the row is stamped or persisted, never on pre-admission history.
+    from agent.resume_prefix_dedupe import apply_to_turn
+
+    _referenced = apply_to_turn(
+        agent, messages, current_turn_user_idx,
+        persist_user_message=persist_user_message,
+        staged_cli_input=isinstance(pending_cli_message, dict) and user_msg is pending_cli_message,
+        compressed=bool(compaction.compressed),
+        moa_active=bool(moa_active),
+    )
+    if _referenced is not None:
+        user_message = _referenced
+        original_user_message = _referenced
     # Every turn, not only on a prompt restore: a long-lived agent (CLI, TUI, Desktop) keeps its
     # prompt in memory for the whole conversation and would never re-check its skills index.
     stage_skills_index_note(agent, active_system_prompt, messages)
