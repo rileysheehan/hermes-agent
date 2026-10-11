@@ -1717,6 +1717,12 @@ def run_conversation(
     """
     from agent.turn_context import export_current_turn_boundary
     from tools.vision_tools_history_budget import native_turn_images
+    from agent.resume_prefix_dedupe import report_turn, verify_final_transcript
+
+    # MER-646: build_turn_context may reference an unchanged leading instruction block instead of repeating it,
+    # deciding on the turn's final canonical rows; it records what it sent here (per turn, never inherited).
+    agent._resume_prefix_reference = None
+    agent._resume_prefix_wire = []
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
@@ -1737,6 +1743,13 @@ def run_conversation(
             turn_author=turn_author,
             title_user_message=title_user_message,
         )
+    _reference = getattr(agent, "_resume_prefix_reference", None)
+    if _reference:
+        # The row this turn actually sent carries the reference text; re-anchor on that. The acceptance signal is
+        # what the requests carried (report_turn); the canonical-transcript check is a diagnostic only.
+        user_message = _reference[2]
+        report_turn(agent)
+        verify_final_transcript(agent, result.get("messages") if isinstance(result, dict) else None)
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
     return result

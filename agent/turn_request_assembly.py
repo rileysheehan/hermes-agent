@@ -229,6 +229,13 @@ def assemble_api_request(
         api_messages = _initial_cache_plan.messages
         tools_for_api = _initial_cache_plan.tools
 
+    # MER-646: when this turn referenced an unchanged instruction block, the request must carry that block
+    # verbatim before the reference; otherwise the full block is put back in this request (fail closed). After
+    # every send-time transform and the cache plan, so it checks the bytes the provider receives.
+    from agent.resume_prefix_dedupe import enforce_on_wire
+
+    api_messages = enforce_on_wire(agent, api_messages)
+
     # Prepare the persistent-MoA request before measuring compression pressure: the
     # ephemeral advisor output is absent from ``messages``; ``create()`` reuses the
     # prepared request instead of running the advisors again.
