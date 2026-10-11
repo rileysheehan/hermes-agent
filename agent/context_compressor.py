@@ -4675,7 +4675,10 @@ Write only the summary body. Do not include any preamble or prefix."""
         so early user turns don't fossilize across repeated compactions (#11996).
         """
         head = 1 if messages and messages[0].get("role") == "system" else 0
-        return head + self._effective_protect_first_n(messages)
+        # resume_prefix_dedupe pins the first user message for the rest of this agent's life when a resumed
+        # wake's message points at it instead of repeating it; decay must not summarise that copy away.
+        pinned = int(getattr(self, "_pinned_head_rows", 0) or 0)
+        return head + max(self._effective_protect_first_n(messages), pinned)
 
     def _align_boundary_backward(self, messages: list[dict[str, Any]], idx: int) -> int:
         """Pull a compress-end boundary back so a tool group is not split (orphaned tail results would be dropped)."""
