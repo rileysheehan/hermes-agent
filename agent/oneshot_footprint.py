@@ -48,7 +48,7 @@ def oneshot_learning() -> bool:
         return False
 
 
-def prune_oneshot_tools(tools: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def prune_oneshot_tools(tools: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """*tools* minus ``ONESHOT_HIDDEN_TOOLS``; identity when the session is not one-shot or opted into learning."""
     tools = list(tools)
     if not is_single_query_session() or oneshot_learning():
