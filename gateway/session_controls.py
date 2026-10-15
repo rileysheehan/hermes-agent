@@ -619,23 +619,55 @@ class AuthorityConnection:
 
     async def _stop_unsettled_finite(self):
         """gateway.finite_stop_on_disconnect: the submitting viewer is gone, so stop each of its finite
-        admissions that has not settled (queued: withdrawn; started: interrupted). Best-effort."""
+        admissions that has not settled. Each one is followed through its own state changes: a queued row
+        is withdrawn, or, when the drain claims it in between (``cancel_or_claimed`` returns the started
+        row), that claim is interrupted; a started row is interrupted at ITS generation, so a successor
+        turn (another generation) is never touched (``authority.interrupt`` refuses a stale generation,
+        and the receipt is re-read). Terminal or unknown: nothing to stop. Never fails the close."""
         import logging
         log = logging.getLogger(__name__)
         owned, self._finite_owned = self._finite_owned, {}
         for admission_id, ref in owned.items():
             try:
-                receipt = await self.authority.receipt(self.actor, ref, admission_id)
-                if receipt.status == 'queued':
-                    await self.cancel(ref, {'admission_id': admission_id})
-                elif receipt.status == 'started':
-                    await self.interrupt(ref, {'execution_generation': receipt.execution_generation})
-                else:
-                    continue
-                log.info("finite viewer gone: stopped %s admission %s (session=%s)",
-                         receipt.status, admission_id, ref.session_id)
+                outcome = await self._stop_finite_admission(ref, admission_id)
             except Exception:  # health: allow BLE001 -- closing the transport must never fail on this
                 log.warning("finite viewer gone: could not stop admission %s", admission_id, exc_info=True)
+                continue
+            if outcome.startswith("gave up"):
+                log.warning("finite viewer gone: admission %s %s (session=%s)", admission_id, outcome, ref.session_id)
+            elif outcome != "settled":
+                log.info("finite viewer gone: %s admission %s (session=%s)", outcome, admission_id, ref.session_id)
+
+    _STOP_ATTEMPTS = 6
+
+    async def _stop_finite_admission(self, ref, admission_id):
+        """Stop one admission whatever state it moves through; returns what happened."""
+        for attempt in range(self._STOP_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(0.05 * attempt)  # a claim between reads publishes its handle shortly
+            receipt = await self.authority.receipt(self.actor, ref, admission_id)
+            if receipt.status == 'queued':
+                try:
+                    row = await self.authority.cancel_or_claimed(self.actor, ref, admission_id)
+                except RuntimeStoreError as exc:
+                    if exc.reason == 'stale_generation':
+                        continue  # settled or moved between the read and the commit: read it again
+                    raise
+                if row is None:
+                    return "withdrew queued"
+                generation, how = row['generation'], "interrupted claimed"
+            elif receipt.status == 'started':
+                generation, how = receipt.execution_generation, "interrupted started"
+            else:
+                return "settled" if receipt.status == 'terminal' else f"left {receipt.status}"
+            try:
+                await self.interrupt(ref, {'execution_generation': generation})
+            except RuntimeStoreError as exc:
+                if exc.reason == 'stale_generation':
+                    continue  # not that generation's turn (yet, or any more): re-read, never stop a successor
+                raise
+            return f"{how} generation {generation}"
+        return f"gave up after {self._STOP_ATTEMPTS} reads (last state {receipt.status})"
 
     async def close(self):
         if self._finite_owned:
