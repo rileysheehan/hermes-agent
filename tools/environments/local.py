@@ -257,7 +257,7 @@ def _inject_session_context_env(env: dict) -> None:
     Tier 2), so a value never puts back a credential the scrub removed; ``None`` unsets a name."""
     try:
         from gateway.session_context import (
-            _UNSET, _VAR_MAP, _bound_session_value, session_context_engaged)
+            _UNSET, _VAR_MAP, _bound_session_value, client_env, session_context_engaged)
     except Exception:
         return
     _engaged = session_context_engaged()
@@ -274,6 +274,9 @@ def _inject_session_context_env(env: dict) -> None:
                 env.pop(name, None)
             else:
                 env[name] = value
+    # A finite turn's forwarded client env (``gateway.client_env_passthrough``): the run's own values,
+    # already filtered by the owner's allowlist; they win over the owner process's environment.
+    env.update(client_env())
 
 
 def _filter_secret_env(

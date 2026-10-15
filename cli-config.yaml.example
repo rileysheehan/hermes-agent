@@ -1441,6 +1441,13 @@ gateway:
   # where slow storage blocks every platform. "warn" logs each call site once with
   # its stack; "raise" fails the call (CI / development). Off by default.
   # sessiondb_loop_guard: off
+  # Env var names a finite `hermes chat -q` client may forward to its own turn's
+  # tools (the gateway runs the turn, so its tools otherwise see only the
+  # gateway's environment). Exact names or a PREFIX* pattern; both the client's
+  # and the owning profile's lists must allow a name. Values are held in memory
+  # for that one turn and never persisted. PATH, HOME, HERMES_HOME, LD_*/DYLD_*
+  # and similar are always refused. Default: empty (nothing forwarded).
+  # client_env_passthrough: ["PAPERCLIP_*"]
 
 # =============================================================================
 # Toolsets

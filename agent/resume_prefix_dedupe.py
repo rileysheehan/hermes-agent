@@ -77,8 +77,18 @@ def reference_text(chars: int, sha256: str) -> str:
 
 
 def _consume_env() -> Optional[tuple[str, int]]:
-    sha = os.environ.pop(ENV_SHA256, None)
-    raw_chars = os.environ.pop(ENV_CHARS, None)
+    # A gateway-run finite turn reads the opt-in its client forwarded (gateway.client_env_passthrough);
+    # an in-process one-shot reads its own environment. Either way it is consumed once.
+    sha = raw_chars = None
+    try:
+        from gateway.session_context import take_client_env_value
+    except Exception:  # health: allow BLE001 -- install without the gateway package
+        take_client_env_value = None
+    if take_client_env_value is not None:
+        sha, raw_chars = take_client_env_value(ENV_SHA256), take_client_env_value(ENV_CHARS)
+    if sha is None and raw_chars is None:
+        sha = os.environ.pop(ENV_SHA256, None)
+        raw_chars = os.environ.pop(ENV_CHARS, None)
     if not sha or not raw_chars:
         return None
     sha = sha.strip().lower()
@@ -299,11 +309,17 @@ def apply_to_turn(
             return None
         row = messages[current_turn_user_idx]
         content = row.get("content")
+        # The gateway always hands its persist text through (the clean message, timestamps stripped);
+        # when it is the very text being sent there is no separate persisted text to keep. The reference
+        # then replaces both, so the transcript holds exactly what the model received.
+        same_persist = isinstance(persist_user_message, str) and persist_user_message == content
         new_message = _dedupe(agent, sha256, chars, content, messages[:current_turn_user_idx],
-                              persist_user_message)
+                              None if same_persist else persist_user_message)
         if new_message is None:
             return None
         row["content"] = new_message
+        if same_persist:
+            agent._persist_user_message_override = new_message
         agent._resume_prefix_reference = (sha256, chars, new_message, str(content)[:chars])
         agent._resume_prefix_wire = []
         return new_message
