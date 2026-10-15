@@ -38,13 +38,30 @@ def is_single_query_session() -> bool:
     else:
         policy = active_policy()
         if policy is not None:
-            return policy.source == "oneshot"
+            if policy.source == "oneshot":
+                return True
+            return _finite_learning_turn()
     try:
         from gateway.session_context import get_session_env
     except Exception:
         import os
         get_session_env = os.environ.get
     return str(get_session_env("HERMES_SINGLE_QUERY_SESSION", "") or "") == "1"
+
+
+def _finite_learning_turn() -> bool:
+    """A finite gateway admission (``chat -q`` under any ``--source``, e.g. an orchestrator's ``tool``
+    runs) on an install that opted into ``oneshot_learning``: the run is one turn of a longer-lived
+    identity, so it is reviewed like the in-process one-shot it replaced. Off by default, so a plain
+    finite turn keeps upstream's session-scoped answer. Never raises."""
+    try:
+        from gateway.session_finite import finite_turn_required
+        if finite_turn_required() is not True:
+            return False
+        from agent.background_review import oneshot_learning_enabled
+        return oneshot_learning_enabled()
+    except Exception:  # health: allow BLE001 -- best-effort
+        return False
 
 
 def oneshot_learning() -> bool:
