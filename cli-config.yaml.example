@@ -1403,6 +1403,12 @@ gateway:
   # and similar are always refused. Default: empty (nothing forwarded).
   # client_env_passthrough: ["PAPERCLIP_*"]
 
+  # Stop a finite `hermes chat -q` turn when the local client that submitted it
+  # disconnects before the turn settles (the client was killed). Off by default:
+  # the gateway keeps running a turn whose viewer went away. Turn it on when an
+  # orchestrator cancels runs by killing the client process.
+  # finite_stop_on_disconnect: false
+
 # =============================================================================
 # Toolsets
 # =============================================================================

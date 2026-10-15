@@ -81,3 +81,13 @@ async def execute_finite_admission(authority, ref, row):
             client_env_scope(row, ref.session_id):
         return await execute_admission(authority, ref, row)
 
+
+def stop_on_disconnect(authority) -> bool:
+    """``gateway.finite_stop_on_disconnect`` (default false). A finite turn (``chat -q``) belongs to the
+    process that submitted it: an orchestrator that kills that process (a cancelled or timed-out run)
+    expects its work to stop, as it did when the run executed in-process. With this on, a finite
+    admission whose submitting native viewer disconnects before it settles is stopped like ``/stop``
+    (queued: withdrawn; started: interrupted). Read from the owning profile's current config."""
+    from gateway.session_client_env import profile_gateway_config
+    from utils import is_truthy_value
+    return is_truthy_value(profile_gateway_config(authority).get("finite_stop_on_disconnect"), default=False)
