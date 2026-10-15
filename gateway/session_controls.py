@@ -55,6 +55,9 @@ class AuthorityConnection:
         bind_native_transport(authority, self.actor, identity)
         self.native_owner = identity.get('native_bootstrap') is True
         self.subscriptions = {}
+        # Finite admissions this native viewer submitted while gateway.finite_stop_on_disconnect is on:
+        # stopped on close() unless they settled first (session_finite.stop_on_disconnect).
+        self._finite_owned: dict = {}
         self._identity, self._operator, self._siblings = identity, operator, {}
         authority.events[self.actor.transport_id] = transport
 
@@ -530,6 +533,10 @@ class AuthorityConnection:
             raise
         if receipt.status == 'terminal':
             session_client_env.discard(ref.session_id, request_id)
+        elif payload.get('finite') is True and self.native_owner:
+            from gateway.session_finite import stop_on_disconnect
+            if stop_on_disconnect(self.authority):
+                self._finite_owned[receipt.admission_id] = ref
         return asdict(receipt)
 
     async def mutate(self, ref, params):
@@ -610,7 +617,29 @@ class AuthorityConnection:
         return await self.authority.respond(self.actor, ref, params["execution_generation"],
             params["prompt_id"], {"answer": params["answer"]}, kind="clarify")
 
+    async def _stop_unsettled_finite(self):
+        """gateway.finite_stop_on_disconnect: the submitting viewer is gone, so stop each of its finite
+        admissions that has not settled (queued: withdrawn; started: interrupted). Best-effort."""
+        import logging
+        log = logging.getLogger(__name__)
+        owned, self._finite_owned = self._finite_owned, {}
+        for admission_id, ref in owned.items():
+            try:
+                receipt = await self.authority.receipt(self.actor, ref, admission_id)
+                if receipt.status == 'queued':
+                    await self.cancel(ref, {'admission_id': admission_id})
+                elif receipt.status == 'started':
+                    await self.interrupt(ref, {'execution_generation': receipt.execution_generation})
+                else:
+                    continue
+                log.info("finite viewer gone: stopped %s admission %s (session=%s)",
+                         receipt.status, admission_id, ref.session_id)
+            except Exception:  # health: allow BLE001 -- closing the transport must never fail on this
+                log.warning("finite viewer gone: could not stop admission %s", admission_id, exc_info=True)
+
     async def close(self):
+        if self._finite_owned:
+            await self._stop_unsettled_finite()
         for sibling in self._siblings.values():
             await sibling.close()
         self._siblings.clear()

@@ -2118,6 +2118,9 @@ DEFAULT_CONFIG = {
         # own turn's tools: per-run values an orchestrator sets for one run. Held in memory only,
         # never persisted. Empty (default) forwards nothing.
         "client_env_passthrough": [],
+        # Stop a finite (``chat -q``) turn whose submitting local client disconnects before it
+        # settles (a killed orchestrator run), as an in-process one-shot died with its process.
+        "finite_stop_on_disconnect": False,
         # Seconds a SIGTERM-interrupted agent unwinds before teardown (short: service stop budgets).
         "signal_interrupt_grace_timeout": 1,
         "service_install_choice": None,  # null | install | decline; never authorizes ordinary launch installation.
