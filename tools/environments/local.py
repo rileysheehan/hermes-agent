@@ -247,7 +247,7 @@ def _inject_session_context_env(env: dict) -> None:
     context is engaged ContextVars are authoritative — a bound value (incl. "") wins
     and an _UNSET var is STRIPPED, not inherited. An unengaged CLI keeps the mirror."""
     try:
-        from gateway.session_context import _UNSET, _VAR_MAP, session_context_engaged
+        from gateway.session_context import _UNSET, _VAR_MAP, client_env, session_context_engaged
     except Exception:
         return
     _engaged = session_context_engaged()
@@ -257,6 +257,9 @@ def _inject_session_context_env(env: dict) -> None:
             env[var_name] = "" if value is None else str(value)
         elif _engaged:
             env.pop(var_name, None)
+    # A finite turn's forwarded client env (``gateway.client_env_passthrough``): the run's own values,
+    # already filtered by the owner's allowlist; they win over the owner process's environment.
+    env.update(client_env())
 
 
 def _filter_secret_env(

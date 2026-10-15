@@ -370,9 +370,18 @@ class BaseEnvironment(ABC):
     def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
         """Profile-scoped names that must not persist in the snapshot. Monotonic for the
         environment lifetime: an allowlist can be cleared after a value was captured, and
-        retaining the exclusion keeps that old value from leaking to a later profile."""
+        retaining the exclusion keeps that old value from leaking to a later profile.
+        A finite turn's forwarded client env names (``gateway.client_env_passthrough``) join the set the
+        same way: they are one run's values (a run credential) and must never reach the shared
+        snapshot or be overridden by an earlier run's value sourced from it."""
+        try:
+            from gateway.session_context import client_env
+            self._snapshot_passthrough_names.update(
+                name for name in client_env() if _SHELL_ENV_NAME_RE.fullmatch(name))
+        except Exception:
+            logger.debug("Could not read forwarded client env names", exc_info=True)
         if not self._profile_scoped_passthrough:
-            return ()
+            return tuple(sorted(self._snapshot_passthrough_names))
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():

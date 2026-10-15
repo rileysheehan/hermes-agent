@@ -2128,6 +2128,10 @@ DEFAULT_CONFIG = {
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
+        # Env var names (exact, or a PREFIX* pattern) a finite ``chat -q`` client may forward to its
+        # own turn's tools: per-run values an orchestrator sets for one run. Held in memory only,
+        # never persisted. Empty (default) forwards nothing.
+        "client_env_passthrough": [],
         # Seconds a SIGTERM-interrupted agent unwinds before teardown (short: service stop budgets).
         "signal_interrupt_grace_timeout": 1,
         "service_install_choice": None,  # null | install | decline; never authorizes ordinary launch installation.

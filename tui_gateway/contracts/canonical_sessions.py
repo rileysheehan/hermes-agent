@@ -228,6 +228,9 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     # The submitter answers the clarify tool's whole batch in one ``clarify`` server request (main's
     # batch panel); without it the turn's viewers get one ``clarify.request`` card per question.
     clarify_batch: bool = False
+    # ``gateway.client_env_passthrough``: a finite client's own per-run env values for its turn's tools.
+    # Held in memory for that admission only; never committed with it (session_client_env).
+    client_env: dict[str, str] | None = None
 
 
 class CanonicalVoiceStopped(Result):

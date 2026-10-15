@@ -692,8 +692,21 @@ class AuthorityConnection:
             self._record_voice_stop(ref, params)
             return {'voice_stopped': True}
         # The interactive WS is the one surface a restart's after-turn wait admits (#139041).
-        receipt = await self.authority.submit(self.actor, self.submission(ref, params),
-                                              queue_while_restarting=self._operator is True)
+        request = self.submission(ref, params)
+        from gateway import session_client_env
+        client_env = session_client_env.admit(
+            params, native_owner=self.native_owner,
+            allow=session_client_env.profile_patterns(self.authority) if 'client_env' in params else ())
+        # Stashed BEFORE the admission commits: the drain may claim it before submit returns.
+        session_client_env.stash(ref.session_id, request.request_id, client_env)
+        try:
+            receipt = await self.authority.submit(self.actor, request,
+                                                  queue_while_restarting=self._operator is True)
+        except BaseException:
+            session_client_env.discard(ref.session_id, request.request_id)
+            raise
+        if receipt.status == 'terminal':
+            session_client_env.discard(ref.session_id, request.request_id)
         return asdict(receipt)
 
     def _voice_stop_key(self, ref, params):
@@ -753,12 +766,18 @@ class AuthorityConnection:
             raise RuntimeStoreError('permission_denied')
         forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended',
                                    'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+                                   'turn_author', 'api_text', 'model_override', 'clarify_batch', 'client_env'}
         if forbidden:
             raise RuntimeStoreError('invalid_params')
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
             raise RuntimeStoreError('invalid_params')
+        from gateway import session_client_env
+        # Validated here for every admission shape (a malformed map is invalid_params); the values are
+        # never part of the durable payload: submit() holds them in memory for its execution only.
+        session_client_env.admit(
+            params, native_owner=self.native_owner,
+            allow=session_client_env.profile_patterns(self.authority) if 'client_env' in params else ())
         from gateway.session_finite import admit_finite
         from gateway.session_display import submit_display_fields
         from gateway.session_surface import submit_surface_fields
