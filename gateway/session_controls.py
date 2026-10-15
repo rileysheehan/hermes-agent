@@ -502,12 +502,17 @@ class AuthorityConnection:
             raise RuntimeStoreError('permission_denied')
         forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended',
                                    'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+                                   'turn_author', 'api_text', 'model_override', 'clarify_batch', 'client_env'}
         if forbidden:
             raise RuntimeStoreError('invalid_params')
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
             raise RuntimeStoreError('invalid_params')
+        from gateway import session_client_env
+        # Never part of the durable payload: held in memory for this admission's execution only.
+        client_env = session_client_env.admit(
+            params, native_owner=self.native_owner,
+            allow=session_client_env.profile_patterns(self.authority) if 'client_env' in params else ())
         from gateway.session_finite import admit_finite
         from gateway.session_display import submit_display_fields
         from gateway.session_surface import submit_surface_fields
@@ -516,7 +521,15 @@ class AuthorityConnection:
                    **submit_display_fields(params), **submit_cli_turn_fields(params)}
         if 'attachments' in params:
             payload['attachments'] = params['attachments']
-        receipt = await self.authority.submit(self.actor, Submission(request_id, ref, payload, 'queue'))
+        # Stashed BEFORE the admission commits: the drain may claim it before submit returns.
+        session_client_env.stash(ref.session_id, request_id, client_env)
+        try:
+            receipt = await self.authority.submit(self.actor, Submission(request_id, ref, payload, 'queue'))
+        except BaseException:
+            session_client_env.discard(ref.session_id, request_id)
+            raise
+        if receipt.status == 'terminal':
+            session_client_env.discard(ref.session_id, request_id)
         return asdict(receipt)
 
     async def mutate(self, ref, params):
