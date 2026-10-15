@@ -484,6 +484,14 @@ def _linger_for_background_review() -> None:
     agent = _active_agent_ref
     if agent is None:
         return
+    try:
+        from hermes_cli.gateway_agent import GatewayAgent
+    except Exception:  # health: allow BLE001 -- best-effort
+        GatewayAgent = None
+    if GatewayAgent is not None and isinstance(agent, GatewayAgent):
+        # The gateway ran this turn and runs its review (it outlives this viewer); a review owed by
+        # another session is paid by that session's next turn there. Nothing to drain in this process.
+        return
     from agent.background_review import drain_background_review, drain_owed_review, drain_timeout_s
 
     started = time.monotonic()
