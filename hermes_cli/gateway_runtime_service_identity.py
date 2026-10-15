@@ -54,12 +54,59 @@ def verify_home(home: Path, configured: str) -> None:
     raise ValueError("profile_mismatch")
 
 
+_OSASCRIPT = "/usr/bin/osascript"
+# gateway_launchd.launchd_program_arguments' fixed JXA template; only the JSON
+# string literal handed to system() varies.
+_JXA_TEMPLATE = re.compile(
+    r'ObjC\.import\("stdlib"\); const status=\$\.system(\("(?:[^"\\\x00-\x1f]|\\.)*"\)); '
+    r'const signal=status & 127; '
+    r'\$\.exit\(status === -1 \? 1 : signal === 0 \? \(status >> 8\) & 255 : 128 \+ signal\);'
+)
+
+
+def _launchd_jxa_command(argv: list[str]) -> list[str]:
+    """The gateway command inside the installer's osascript launchd wrapper.
+
+    Recognizes only the complete template, whose shell text must round-trip
+    exactly through the installer's own quoting: ``exec <shlex.join(cmd)> >>
+    <stdout> 2>> <stderr>``. Any other shell syntax (a second command, an
+    expansion, a redirect elsewhere) does not round-trip and stays unverified.
+    """
+    import json
+
+    if len(argv) != 5 or argv[:4] != [_OSASCRIPT, "-l", "JavaScript", "-e"]:
+        _unverified()
+    match = _JXA_TEMPLATE.fullmatch(argv[4])
+    if not match:
+        _unverified()
+    try:
+        shell = json.loads(match[1][1:-1])
+        tokens = shlex.split(shell)
+    except ValueError:
+        _unverified()
+    if not isinstance(shell, str) or len(tokens) < 6 or tokens[0] != "exec" or tokens[-4] != ">>" or tokens[-2] != "2>>":
+        _unverified()
+    command, stdout_log, stderr_log = tokens[1:-4], tokens[-3], tokens[-1]
+    _absolute(stdout_log), _absolute(stderr_log)
+    if shell != f"exec {shlex.join(command)} >> {shlex.quote(stdout_log)} 2>> {shlex.quote(stderr_log)}":
+        _unverified()
+    return command
+
+
 def verify_gateway_argv(argv: list[str], home: Path) -> None:
     from gateway.status import looks_like_gateway_command_line
 
-    # The installer wraps launchd stderr with this fixed, non-shell module.
-    if len(argv) > 7 and argv[1:4] == ["-m", "hermes_cli.stderr_timestamp", "--error-log"] and argv[5] == "--":
-        if not re.fullmatch(r"python(?:w|\d+(?:\.\d+)*)?(?:\.exe)?", Path(argv[0]).name.lower()):
+    # macOS installs run the gateway under /usr/bin/osascript (#71206).
+    if argv[:1] == [_OSASCRIPT]:
+        argv = _launchd_jxa_command(argv)
+    # The installer wraps launchd stderr with this fixed, non-shell module,
+    # through the interpreter or through the source launcher's --run-module.
+    if len(argv) > 7 and argv[2:4] == ["hermes_cli.stderr_timestamp", "--error-log"] and argv[5] == "--":
+        executable = Path(argv[0]).name.lower()
+        if argv[1] == "-m":
+            if not re.fullmatch(r"python(?:w|\d+(?:\.\d+)*)?(?:\.exe)?", executable):
+                _unverified()
+        elif argv[1] != "--run-module" or executable not in {"hermes", "hermes.exe"}:
             _unverified()
         argv = argv[6:]
     if not argv or not looks_like_gateway_command_line(subprocess_command(argv)):
