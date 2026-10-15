@@ -172,11 +172,42 @@ def reset_session_vars() -> None:
 
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
-    ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""
+    ContextVar wins if ever set here (even to ``""``); else the finite turn's forwarded client env
+    (``gateway.client_env_passthrough``); else ``os.environ``; else *default*."""
     var = _VAR_MAP.get(name)
     if var is not None and (value := var.get()) is not _UNSET:
         return value
+    forwarded = _CLIENT_ENV.get()
+    if forwarded and name in forwarded:
+        return forwarded[name]
     return os.getenv(name, default)
+
+
+# The finite turn's forwarded client environment (gateway/session_client_env.py): bound for one
+# admission's execution, read by get_session_env and bridged into every child env.
+_CLIENT_ENV: ContextVar[dict | None] = ContextVar("HERMES_CLIENT_ENV", default=None)
+
+
+def bind_client_env(env: dict | None):
+    return _CLIENT_ENV.set(dict(env) if env else None)
+
+
+def reset_client_env(token) -> None:
+    _CLIENT_ENV.reset(token)
+
+
+def client_env() -> dict:
+    """The forwarded client env of the turn executing in this context (``{}`` when none)."""
+    return dict(_CLIENT_ENV.get() or {})
+
+
+def take_client_env_value(name: str) -> str | None:
+    """Read-once accessor for an opt-in a turn consumes exactly once (MER-646's resume prefix): the
+    value is removed from this turn's binding, so a later read in the same turn sees nothing."""
+    forwarded = _CLIENT_ENV.get()
+    if not forwarded or name not in forwarded:
+        return None
+    return forwarded.pop(name)
 
 
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/

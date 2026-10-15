@@ -484,6 +484,11 @@ class GatewayAgent:
             params["display_kind"] = staged["display_kind"]
         if getattr(self, "_finite", False):
             params["finite"] = True
+            # ``gateway.client_env_passthrough``: this run's own per-run values (an orchestrator's run
+            # credential, an opt-in) for its turn's tools; the owner re-filters and never persists them.
+            forwarded = _client_env_for_turn()
+            if forwarded:
+                params["client_env"] = forwarded
         if self.clarify_callback is not None:
             # Main's batch panel answers the clarify tool's whole question set (one ``clarify`` request).
             params["clarify_batch"] = True
@@ -983,3 +988,16 @@ _HANDLERS = {
     "approval.request": GatewayAgent._on_approval,
     "clarify.request": GatewayAgent._on_clarify,
 }
+
+
+def _client_env_for_turn() -> dict:
+    """The allowlisted (``gateway.client_env_passthrough``) names of this process's environment, for a
+    finite turn; ``{}`` when the list is empty or unreadable."""
+    import os
+    try:
+        from hermes_cli.config import load_config_readonly
+        from gateway.session_client_env import patterns, select
+        return select(os.environ, patterns(load_config_readonly()))
+    except Exception:  # health: allow BLE001 -- forwarding nothing is the pre-patch behaviour
+        logger.debug("client env: allowlist unreadable; forwarding nothing", exc_info=True)
+        return {}

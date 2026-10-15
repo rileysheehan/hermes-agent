@@ -55,6 +55,9 @@ class AuthorityConnection:
         bind_native_transport(authority, self.actor, identity)
         self.native_owner = identity.get('native_bootstrap') is True
         self.subscriptions = {}
+        # Finite admissions this native viewer submitted while gateway.finite_stop_on_disconnect is on:
+        # stopped on close() unless they settled first (session_finite.stop_on_disconnect).
+        self._finite_owned: dict = {}
         self._identity, self._operator, self._siblings = identity, operator, {}
         authority.events[self.actor.transport_id] = transport
 
@@ -502,12 +505,17 @@ class AuthorityConnection:
             raise RuntimeStoreError('permission_denied')
         forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended',
                                    'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+                                   'turn_author', 'api_text', 'model_override', 'clarify_batch', 'client_env'}
         if forbidden:
             raise RuntimeStoreError('invalid_params')
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
             raise RuntimeStoreError('invalid_params')
+        from gateway import session_client_env
+        # Never part of the durable payload: held in memory for this admission's execution only.
+        client_env = session_client_env.admit(
+            params, native_owner=self.native_owner,
+            allow=session_client_env.profile_patterns(self.authority) if 'client_env' in params else ())
         from gateway.session_finite import admit_finite
         from gateway.session_display import submit_display_fields
         from gateway.session_surface import submit_surface_fields
@@ -516,7 +524,19 @@ class AuthorityConnection:
                    **submit_display_fields(params), **submit_cli_turn_fields(params)}
         if 'attachments' in params:
             payload['attachments'] = params['attachments']
-        receipt = await self.authority.submit(self.actor, Submission(request_id, ref, payload, 'queue'))
+        # Stashed BEFORE the admission commits: the drain may claim it before submit returns.
+        session_client_env.stash(ref.session_id, request_id, client_env)
+        try:
+            receipt = await self.authority.submit(self.actor, Submission(request_id, ref, payload, 'queue'))
+        except BaseException:
+            session_client_env.discard(ref.session_id, request_id)
+            raise
+        if receipt.status == 'terminal':
+            session_client_env.discard(ref.session_id, request_id)
+        elif payload.get('finite') is True and self.native_owner:
+            from gateway.session_finite import stop_on_disconnect
+            if stop_on_disconnect(self.authority):
+                self._finite_owned[receipt.admission_id] = ref
         return asdict(receipt)
 
     async def mutate(self, ref, params):
@@ -597,7 +617,29 @@ class AuthorityConnection:
         return await self.authority.respond(self.actor, ref, params["execution_generation"],
             params["prompt_id"], {"answer": params["answer"]}, kind="clarify")
 
+    async def _stop_unsettled_finite(self):
+        """gateway.finite_stop_on_disconnect: the submitting viewer is gone, so stop each of its finite
+        admissions that has not settled (queued: withdrawn; started: interrupted). Best-effort."""
+        import logging
+        log = logging.getLogger(__name__)
+        owned, self._finite_owned = self._finite_owned, {}
+        for admission_id, ref in owned.items():
+            try:
+                receipt = await self.authority.receipt(self.actor, ref, admission_id)
+                if receipt.status == 'queued':
+                    await self.cancel(ref, {'admission_id': admission_id})
+                elif receipt.status == 'started':
+                    await self.interrupt(ref, {'execution_generation': receipt.execution_generation})
+                else:
+                    continue
+                log.info("finite viewer gone: stopped %s admission %s (session=%s)",
+                         receipt.status, admission_id, ref.session_id)
+            except Exception:  # health: allow BLE001 -- closing the transport must never fail on this
+                log.warning("finite viewer gone: could not stop admission %s", admission_id, exc_info=True)
+
     async def close(self):
+        if self._finite_owned:
+            await self._stop_unsettled_finite()
         for sibling in self._siblings.values():
             await sibling.close()
         self._siblings.clear()
