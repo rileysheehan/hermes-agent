@@ -231,6 +231,22 @@ def _review_input_token_budget(
 def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
     """Single config read -> ``(enabled, task_cfg)``. Fail-open (``enabled=True``) so a broken
     config never silently disables reviews — but WARN so the cost is visible."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    from gateway.session_finite import finite_turn_required
+
+    # A finite gateway turn (`chat -q` / `-z`) is one-shot like the in-process run, whose exit
+    # takes the daemon review thread with it; the long-lived gateway would otherwise fork a
+    # ~30K-token review after the viewer has already gone. An install that opted into
+    # ``oneshot_learning`` (its one-shot runs are turns of a longer-lived identity) wants exactly
+    # that review, and the gateway outliving the viewer is what lets it finish.
+    if safe_worker_enabled():
+        return False, {}
+    if finite_turn_required() is True:
+        task = _background_review_task_config()
+        if not oneshot_learning_enabled(task):
+            return False, {}
+        from utils import is_truthy_value
+        return is_truthy_value(task.get("enabled"), default=True), task
     try:
         from hermes_cli.config import load_config_readonly
         from utils import is_truthy_value

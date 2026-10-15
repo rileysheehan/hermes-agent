@@ -227,7 +227,7 @@ def _inject_session_context_env(env: dict) -> None:
     context is engaged ContextVars are authoritative — a bound value (incl. "") wins
     and an _UNSET var is STRIPPED, not inherited. An unengaged CLI keeps the mirror."""
     try:
-        from gateway.session_context import _UNSET, _VAR_MAP, session_context_engaged
+        from gateway.session_context import _UNSET, _VAR_MAP, client_env, session_context_engaged
     except Exception:
         return
     _engaged = session_context_engaged()
@@ -237,6 +237,9 @@ def _inject_session_context_env(env: dict) -> None:
             env[var_name] = "" if value is None else str(value)
         elif _engaged:
             env.pop(var_name, None)
+    # A finite turn's forwarded client env (``gateway.client_env_passthrough``): the run's own values,
+    # already filtered by the owner's allowlist; they win over the owner process's environment.
+    env.update(client_env())
 
 
 def _filter_secret_env(
@@ -312,6 +315,14 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     spawn path, search workers, computer-use driver, user-script runners)."""
     return _scrubbed_env([(base_env or {}, False), (extra_env or {}, True)],
                          _plugin_terminal_env_strip_keys(), lambda p: p)
+
+
+def _terminal_env(env: dict) -> dict:
+    """*env* with the user's tools first on PATH (``_user_tools_first``), for background commands."""
+    path_key = _path_env_key(env)
+    if path_key is not None:
+        env[path_key] = _user_tools_first(env[path_key])
+    return env
 
 
 def hermes_subprocess_env(
@@ -561,10 +572,18 @@ def _prepend_missing_path_entries(existing_path: str, dirs: list[str]) -> str:
     return os.pathsep.join([*missing, *entries]) if missing else existing_path
 
 
-def _prepend_git_bash_dirs(existing_path: str) -> str:
-    """Prepend Git Bash's binary dirs if missing (no-op off Windows), so the
-    non-login ``bash -c`` fallback can find coreutils."""
-    return _prepend_missing_path_entries(existing_path, _git_bash_bin_dirs())
+def _user_tools_first(existing_path: str) -> str:
+    """*existing_path* with the user's tools before Hermes's (``pm.user_facing``) and, on
+    Windows, Git Bash's dirs first. They go first even when already listed: they are store
+    dirs that now sit behind the user's entries, and a non-login ``bash -c`` needs its
+    coreutils ahead of System32's lookalikes."""
+    from pm.user_facing import user_facing_path
+
+    path = user_facing_path(existing_path)
+    bash_dirs = _git_bash_bin_dirs()
+    keys = {os.path.normcase(d) for d in bash_dirs}
+    rest = [p for p in path.split(os.pathsep) if p and os.path.normcase(p) not in keys]
+    return os.pathsep.join([*bash_dirs, *rest]) if bash_dirs else path
 
 
 # POSIX-sh-family shells that understand spawn_local's ``[shell, "-lic", "set +m; …"]``
@@ -738,7 +757,7 @@ def _make_run_env(env: dict) -> dict:
     run_env = _scrubbed_env(
         [(dict(strip_launch_profile_env(os.environ.copy()) | env), True)],
         frozenset(),
-        lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)),
+        lambda p: _user_tools_first(_append_missing_sane_path_entries(p)),
     )
     # While this profile's Bot Desktop is running, its DISPLAY/XAUTHORITY/DBUS ride along so GUI
     # apps the agent launches from the terminal open on the Bot Screen the user is watching, not

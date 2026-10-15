@@ -7,7 +7,7 @@
 # Schema version of this file. The installers copy it to seed config.yaml, and
 # `hermes update` uses it to know which one-time migrations the file already
 # has. Hermes manages it: do not copy it into another config.
-_config_version: 50
+_config_version: 51
 
 # =============================================================================
 # Database Configuration
@@ -1365,6 +1365,20 @@ gateway:
   # use (e.g. a Windows Scheduled Task picking up a local Clash/V2Ray proxy that
   # isn't running). Explicit per-platform vars like DISCORD_PROXY still apply.
   # trust_env: true
+
+  # Env var names a finite `hermes chat -q` client may forward to its own turn's
+  # tools (the gateway runs the turn, so its tools otherwise see only the
+  # gateway's environment). Exact names or a PREFIX* pattern; both the client's
+  # and the owning profile's lists must allow a name. Values are held in memory
+  # for that one turn and never persisted. PATH, HOME, HERMES_HOME, LD_*/DYLD_*
+  # and similar are always refused. Default: empty (nothing forwarded).
+  # client_env_passthrough: ["PAPERCLIP_*"]
+
+  # Stop a finite `hermes chat -q` turn when the local client that submitted it
+  # disconnects before the turn settles (the client was killed). Off by default:
+  # the gateway keeps running a turn whose viewer went away. Turn it on when an
+  # orchestrator cancels runs by killing the client process.
+  # finite_stop_on_disconnect: false
 
 # =============================================================================
 # Toolsets
