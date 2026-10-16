@@ -317,6 +317,9 @@ def drain_owed_review(agent: Any, *, budget: float) -> bool:
     """``carry_owed_reviews``: at one-shot exit, review ONE other session of this profile whose review
     was owed and whose process is gone (killed, cancelled, or never resumed), from its transcript in
     ``state.db``, inside what is left of the exit-linger budget. Returns True when it finished."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return False
     if agent is None or budget < _OWED_MIN_BUDGET_S:
         return False
     from agent import owed_review
@@ -379,6 +382,9 @@ def schedule_owed_review_drain(agent: Any, *, interrupted: bool = False) -> bool
     on a daemon thread so the turn's delivery is never held. An interrupted (stopped, disconnected) turn
     does not start one. Returns True when the drain thread was started. Never raises.
     """
+    from agent.evaluation_policy import active
+    if active(agent):
+        return False
     try:
         if agent is None or interrupted:
             return False
