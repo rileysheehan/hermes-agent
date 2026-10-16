@@ -352,6 +352,9 @@ class AuthorityConnection:
             from gateway.session_authorities import async_owner_scope
             from gateway.session_connections import METHODS as CONNECTION_METHODS, session_owned
             async with async_owner_scope(self.authority):
+                if ref.session_id:
+                    from gateway.session_evaluation import guard_method
+                    guard_method(self.authority, ref, method)
                 if method in GROUP_METHODS or method == 'profiles.list':
                     result = await dispatch_group_control(self, method, params)
                 elif method not in handlers or (method in CONNECTION_METHODS and not session_owned(params)):
@@ -476,6 +479,8 @@ class AuthorityConnection:
     async def create(self, ref, params):
         from gateway.session_local_title import validate_title
         title = validate_title(params.pop('title')) if 'title' in params else None
+        if 'evaluation_isolation' in params and not title:
+            raise RuntimeStoreError('evaluation_policy_locked')
         if title is None:
             return await self._create(params, None)
         # ``-c <title> --create-if-missing``: resolve -> create -> title is one owner step per
@@ -506,6 +511,8 @@ class AuthorityConnection:
             # or ignore-user-config launch never reads the profile, so it stays frozen. An exact
             # retry of a creation staged without the flag keeps that frozen request.
             params.setdefault('follow_profile_config', True)
+        if ref and 'evaluation_isolation' in params:
+            raise RuntimeStoreError('evaluation_policy_locked')
         if not ref:
             skills_prompt = None
             if 'skills' in params:
@@ -554,7 +561,8 @@ class AuthorityConnection:
         return {'instance_id': self.authority.instance_id, 'profile_id': self.authority.profile_id,
                 'authority_epoch': self.authority.epoch,
                 'capabilities': ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', 'acp-editor-policy-v1',
-                                 'acp-session-mcp-v1', 'clarify-batch-v1'],
+                                 'acp-session-mcp-v1', 'clarify-batch-v1',
+                                 'evaluation-isolation-v1'],
                 'session_create': {'sources': sorted(SURFACES),
                                    'parameters': sorted(CREATE_FIELDS | {'title'})},
                 # Main's ``gateway.ready.skin``: the canonical client's own ready carries it.
