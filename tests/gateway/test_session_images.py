@@ -131,3 +131,10 @@ def test_authenticated_daemon_upload_retains_exact_admitted_bytes(tmp_path):
                               'owner_path': str(path), 'retained': retained, 'no_admission_on_upload': True}))
     with daemon(root, home, env, barrier=False) as (_, desc):
         asyncio.run(exercise(desc))
+
+
+@pytest.fixture(autouse=True)
+def _no_evaluation_receipt_guard(monkeypatch):
+    """These fixtures build LOCAL sessions without the durable policy receipt every real one has; the carried
+    evaluation-isolation guard (gateway/session_evaluation.py) would refuse them before the behaviour under test."""
+    monkeypatch.setattr("gateway.session_evaluation.locked", lambda authority, ref: False)

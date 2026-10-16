@@ -368,3 +368,10 @@ async def test_cancel_committed_before_a_failed_media_cleanup_still_settles_obse
     completions = [f for f in frames if f['params']['type'] == 'message.complete']
     assert len(completions) == 1 and completions[0]['params']['payload']['outcome'] == 'cancelled'
     assert len(scheduled) == 1, 'the successors of a paused head need exactly one fresh drain'
+
+
+@pytest.fixture(autouse=True)
+def _no_evaluation_receipt_guard(monkeypatch):
+    """These fixtures build LOCAL sessions without the durable policy receipt every real one has; the carried
+    evaluation-isolation guard (gateway/session_evaluation.py) would refuse them before the behaviour under test."""
+    monkeypatch.setattr("gateway.session_evaluation.locked", lambda authority, ref: False)

@@ -111,3 +111,10 @@ def test_held_servers_are_relisted_together_under_one_bound(monkeypatch, mcp_loo
     elapsed = time.monotonic() - began
     assert sorted(met) == [0, 1], 'the re-lists ran one after another'
     assert elapsed < 2 * bound, elapsed
+
+
+@pytest.fixture(autouse=True)
+def _no_evaluation_receipt_guard(monkeypatch):
+    """These fixtures build LOCAL sessions without the durable policy receipt every real one has; the carried
+    evaluation-isolation guard (gateway/session_evaluation.py) would refuse them before the behaviour under test."""
+    monkeypatch.setattr("gateway.session_evaluation.locked", lambda authority, ref: False)

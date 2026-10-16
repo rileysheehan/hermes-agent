@@ -169,3 +169,10 @@ async def test_command_authority_precedes_resolution_and_mutation(tmp_path, monk
                 'params': {'session_id': 'local-test', **payload}})
             assert result.get('error', {}).get('message') == reason, result
         await connection.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_evaluation_receipt_guard(monkeypatch):
+    """These fixtures build LOCAL sessions without the durable policy receipt every real one has; the carried
+    evaluation-isolation guard (gateway/session_evaluation.py) would refuse them before the behaviour under test."""
+    monkeypatch.setattr("gateway.session_evaluation.locked", lambda authority, ref: False)

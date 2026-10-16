@@ -38,3 +38,10 @@ async def test_upload_profile_selector_names_own_home_or_is_refused(tmp_path, mo
         assert foreign['error']['message'] == 'profile_mismatch', foreign
         assert len(list((home / 'cache/images').iterdir())) == 1
         await owner.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_evaluation_receipt_guard(monkeypatch):
+    """These fixtures build LOCAL sessions without the durable policy receipt every real one has; the carried
+    evaluation-isolation guard (gateway/session_evaluation.py) would refuse them before the behaviour under test."""
+    monkeypatch.setattr("gateway.session_evaluation.locked", lambda authority, ref: False)

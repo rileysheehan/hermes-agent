@@ -5179,6 +5179,7 @@ export interface CanonicalCreateParams {
   profile?: string | null
   request_id?: string | null
   source?: 'cli' | 'tui' | 'gui' | 'acp' | 'tool' | 'oneshot'
+  evaluation_isolation?: number | null
   cwd?: string | null
   row_cwd?: string | null
   model?: string | null
@@ -5286,6 +5287,7 @@ export interface CanonicalSnapshotInfo {
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
   client?: CanonicalClientLabel | null
+  evaluation_isolation?: Record<string, unknown> | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
   service_tier?: string | null
@@ -5429,6 +5431,7 @@ export interface CanonicalSubmitParams {
   api_text?: string | null
   model_override?: CanonicalModelOverride | null
   clarify_batch?: boolean
+  client_env?: Record<string, string> | null
 }
 export interface CanonicalAttachment {
   path: string

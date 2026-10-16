@@ -30,6 +30,7 @@ class CanonicalClientIdentity(Params):
 class CanonicalCreateParams(ProfileParams):
     request_id: str | None = None
     source: Literal['cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'] = 'cli'
+    evaluation_isolation: int | None = None
     cwd: str | None = None
     # The sessions-row ``cwd`` when it differs from the execution ``cwd`` (the classic CLI records
     # main's stamp: the launch dir, ``""`` = none); ``cwd`` stays where the tools run.
@@ -132,6 +133,7 @@ class CanonicalSnapshotInfo(SessionInventoryFields):
     launch_request: dict[str, JsonValue] | None = None
     # ``session.info``'s ``client``: create and resume return the same projection.
     client: CanonicalClientLabel | None = None
+    evaluation_isolation: dict[str, JsonValue] | None = None
     reasoning_effort: str | None = None
     reasoning_effort_wire: str | None = None
     service_tier: str | None = None

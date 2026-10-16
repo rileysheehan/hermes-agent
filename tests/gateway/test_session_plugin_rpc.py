@@ -330,3 +330,10 @@ async def test_plugin_frontend_gets_schema_checked_json_from_its_own_task_with_i
         assert request['response_format']['type'] == 'json_schema'
     sent = json.dumps([request['messages'] for request in model.requests])
     assert 'revenue by month' in sent and secret not in sent
+
+
+@pytest.fixture(autouse=True)
+def _no_evaluation_receipt_guard(monkeypatch):
+    """These fixtures build LOCAL sessions without the durable policy receipt every real one has; the carried
+    evaluation-isolation guard (gateway/session_evaluation.py) would refuse them before the behaviour under test."""
+    monkeypatch.setattr("gateway.session_evaluation.locked", lambda authority, ref: False)

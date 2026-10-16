@@ -8659,6 +8659,18 @@
             "title": "Source",
             "type": "string"
           },
+          "evaluation_isolation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Evaluation Isolation"
+          },
           "cwd": {
             "anyOf": [
               {
@@ -11424,6 +11436,19 @@
             ],
             "default": null
           },
+          "evaluation_isolation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Evaluation Isolation"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -11792,6 +11817,21 @@
             "default": false,
             "title": "Clarify Batch",
             "type": "boolean"
+          },
+          "client_env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Env"
           }
         },
         "required": [
@@ -30626,7 +30666,6 @@
         "type": "object"
       },
       "ProfileCreateReceipt": {
-        "additionalProperties": false,
         "description": "What ``hermes profile create`` prints about a new profile, read on the machine (and in the\nprofile scope) that made it: built after a local create, or sent by the gateway that made it\n(``profiles.create`` with ``report``). The contract uses this type itself; a stdlib dataclass, so a\nlocal create never loads pydantic. A client treats a receipt missing a field, or with a wrong type,\nas an unknown outcome.",
         "properties": {
           "path": {

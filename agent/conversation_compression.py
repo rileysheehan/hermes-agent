@@ -162,14 +162,7 @@ def compaction_status_kind(kind: str, text: object) -> str:
     return "compacting" if kind == "lifecycle" and is_compaction_progress_status(text) else str(kind)
 
 
-def _refresh_agent_tool_definitions(agent) -> bool:
-    """Rebuild agent.tools at the compaction commit boundary (the only moment config reaches a forever-session's
-    frozen tool schemas; the prompt cache is already invalid). Returns True when tools were added."""
-    from tools.mcp_tool_agent import refresh_agent_mcp_tools
-    added = refresh_agent_mcp_tools(agent, content_aware=True)
-    if added:
-        logger.info("Compaction tool refresh added tools: %s", sorted(added))
-    return bool(added)
+from agent.conversation_compression_tools import refresh_agent_tool_definitions as _refresh_agent_tool_definitions
 
 
 _COMPRESSOR_ATTEMPT_STATE_FIELDS = (

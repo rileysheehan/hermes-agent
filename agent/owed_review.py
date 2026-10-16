@@ -67,6 +67,9 @@ def enabled(task_cfg: Optional[dict[str, Any]] = None) -> bool:
 def applies(agent: Any, task_cfg: Optional[dict[str, Any]] = None) -> bool:
     """True when this agent's automatic reviews are carried: opted in, a top-level persisted session,
     and not a caller that suppresses reviews (cron)."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return False
     if agent is None or not getattr(agent, "session_id", None):
         return False
     if getattr(agent, "skip_background_review", False) or getattr(agent, "_delegate_depth", 0) > 0:
