@@ -931,6 +931,16 @@ def finalize_turn(
         owed_kwargs=dict(owed_session=_owed_session, owed_token=_owed_token) if _owed_token else None,
     )
 
+    # ``carry_owed_reviews`` on a finite gateway turn: the one-shot exit linger no longer runs in the
+    # turn's process, so the gateway pays ONE review another session of this profile still owes, after
+    # this turn's own review (so the wait sees it). A no-op outside a finite gateway turn and for cron
+    # (owed_review.applies); never breaks the turn.
+    if _owed_session:
+        with suppress(Exception):
+            from agent.background_review import schedule_owed_review_drain
+
+            schedule_owed_review_drain(agent, interrupted=bool(interrupted or not final_response))
+
     # Opt-in (compression.prepare_ahead): near the trigger, write the next compaction summary
     # between turns. No-op otherwise; never raises. Not after a vetoed turn (no model calls).
     from agent.prepared_compaction import maybe_prepare
