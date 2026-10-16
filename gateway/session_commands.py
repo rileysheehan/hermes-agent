@@ -418,6 +418,8 @@ def _session_workspace(runner, source):
 async def execute_command(connection, ref, params, *, dispatch=False):
     authority, actor = connection.authority, connection.actor
     authority.authorize(actor, ref, 'session:read')
+    from gateway.session_evaluation import guard_method
+    guard_method(authority, ref, 'command.dispatch')
     name, arg = _parse(params, dispatch)
     from hermes_cli.commands import resolve_command
     from hermes_cli.profiles import profile_matches_home

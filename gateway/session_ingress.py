@@ -234,6 +234,14 @@ async def execute_admission(authority, ref, row):
         from gateway.session_cron import execute
         return await execute(authority, ref, row, policy)
     local_policy = policy
+    if local_policy is not None and local_policy.evaluation_isolation:
+        from gateway.session_evaluation import proof
+        proof(authority, ref, local_policy)
+        if (set(row['payload']) - {'text', 'finite', 'unattended'}
+                or row['payload'].get('finite') is not True
+                or not isinstance(row['payload'].get('text'), str)
+                or row['payload']['text'].lstrip().startswith('/')):
+            raise RuntimeStoreError('evaluation_policy_locked')
     from gateway.session_managed_worker import managed_policy, admit_managed
     policy = managed_policy(authority, ref)
     if policy is not None:

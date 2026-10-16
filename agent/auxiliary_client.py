@@ -2572,21 +2572,13 @@ def _relay_aux_call_scope(args: tuple, kwargs: dict):
 
 
 def _relay_auxiliary_call(callback):
-    """Give every physical retry in one auxiliary call a shared Relay identity."""
-    @functools.wraps(callback)
-    def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
-            return callback(*args, **kwargs)
-    return wrapped
+    from agent.auxiliary_call_guard import guarded_call
+    return guarded_call(callback, lambda args, kwargs: _relay_aux_call_scope(args, kwargs))
 
 
 def _relay_auxiliary_call_async(callback):
-    """Async counterpart to :func:`_relay_auxiliary_call`."""
-    @functools.wraps(callback)
-    async def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
-            return await callback(*args, **kwargs)
-    return wrapped
+    from agent.auxiliary_call_guard import guarded_call_async
+    return guarded_call_async(callback, lambda args, kwargs: _relay_aux_call_scope(args, kwargs))
 
 
 def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode: str | None) -> None:

@@ -1094,6 +1094,11 @@ def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    from agent.evaluation_policy import active, empty_tools
+    if active(agent):
+        agent.disabled_toolsets = disabled_toolsets
+        empty_tools(agent)
+        return
     # A feature that left core for a catalog plugin (Home Assistant) is installed for a home that
     # used it, once per process, before discovery so its tools are in this agent's snapshot.
     from hermes_cli.left_core_migration import recover_at_startup
@@ -1163,23 +1168,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         print(f"💾 Prompt caching: ENABLED ({source}, {agent._cache_ttl} TTL)")
 
 
-def _publish_session_id(session_id: str) -> None:
-    """Expose the session ID to tools via ContextVar (+ legacy os.environ fallback).
-
-    If the ContextVar bridge fails to import, keep the root-agent env fallback but never let
-    delegated construction publish a child ID process-wide.
-    """
-    try:
-        from gateway.session_context import set_current_session_id
-        set_current_session_id(session_id)
-    except Exception:
-        try:
-            from agent.delegation_context import is_delegated_child_context
-            delegated_child = is_delegated_child_context()
-        except Exception:
-            delegated_child = False
-        if not delegated_child:
-            os.environ["HERMES_SESSION_ID"] = session_id
+from agent.agent_init_identity import publish_session_id as _publish_session_id
 
 
 def _init_session_state(agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
@@ -2286,6 +2275,10 @@ def init_agent(
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
+    from agent.evaluation_policy import bind_agent
+    bind_agent(agent, session_id)
+    if agent._evaluation_isolation:
+        skip_background_review = True
     from agent.safe_worker_policy import safe_worker_enabled
 
     if safe_worker_enabled():
@@ -2374,6 +2367,8 @@ def init_agent(
 
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
+    from agent.evaluation_policy import assert_provider
+    assert_provider(agent)
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
@@ -2388,6 +2383,9 @@ def init_agent(
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    from agent.evaluation_policy import active, empty_tools
+    if active(agent):
+        empty_tools(agent)  # provider/context-engine injection must not advertise tools either
 
 
 __all__ = ["init_agent"]

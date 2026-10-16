@@ -199,6 +199,9 @@ def _maybe_title_session_at_turn_start(
     agent: Any, messages: list[Any], title_user_message: Optional[str] = None,
 ) -> None:
     """Kick off auto-titling for the session's first user message; never fatal."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not session_db or not session_id:
@@ -271,6 +274,9 @@ def _maybe_title_session_at_turn_start(
 
 def start_deferred_title_upgrade(agent: Any) -> None:
     """Fire the title upgrade ``_maybe_title_session_at_turn_start`` held back; no-op when none."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return
     upgrade = getattr(agent, "_deferred_title_upgrade", None)
     if upgrade is None:
         return
@@ -553,6 +559,9 @@ def _refresh_mcp_tools_between_turns(agent: Any) -> None:
     """Late-connecting MCP servers land in THIS turn's snapshot, before the first API
     call assembles ``tools=``. ``preserve_prefix`` keeps the tool array append-only so a
     flapping ``check_fn`` can't fork the cache."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return
     try:
         # An authorization that committed after its connection card closed: same import-cost gate,
         # the module is loaded only in a process that ran a connection operation.

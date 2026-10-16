@@ -16,7 +16,8 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+                           'evaluation_isolation'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -162,6 +163,7 @@ class LocalSessionPolicy:
     # An ACP session's edit approval (``session.mutate edit_policy``; main's ACP modes): ``ask`` (Default),
     # ``workspace_session`` (Accept Edits) or ``session`` (Don't Ask). Sensitive paths always ask.
     edit_approval_policy: str = 'ask'
+    evaluation_isolation: bool = False
 
     def client_env(self):
         return None if self.client_env_json is None else json.loads(self.client_env_json)
@@ -419,6 +421,19 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
     from hermes_constants import get_hermes_home
 
     source = params.get('source', 'cli')
+    evaluation = 'evaluation_isolation' in params
+    if evaluation:
+        if (type(params['evaluation_isolation']) is not int or params['evaluation_isolation'] != 1
+                or source != 'oneshot' or any(params.get(k) for k in (
+                    'safe_mode', 'ignore_user_config', 'ignore_rules', 'editor', 'skills',
+                    'checkpoints', 'accept_hooks', 'follow_profile_config'))
+                or (config.get('gateway') or {}).get('managed_workers') is True):
+            raise RuntimeStoreError('evaluation_policy_locked')
+        from agent.evaluation_policy import require_provider, EvaluationIsolationError
+        try:
+            require_provider(get_hermes_home(), config)
+        except (OSError, EvaluationIsolationError) as exc:
+            raise RuntimeStoreError('evaluation_isolation_unproven') from exc
     if source == 'a2a':
         from gateway.session_a2a import build_forward_policy
         return build_forward_policy(params, config, private_secrets=private_secrets)
@@ -487,7 +502,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
                               safe_mode=safe_mode, ignore_user_config=ignore_user_config,
                               coding_posture=coding_posture, client_env_json=client_env,
                               client_env_remote=client_env is not None and not client_local,
-                              client_env_rules_json=rules)
+                              client_env_rules_json=rules, evaluation_isolation=evaluation)
 
 
 def terminal_uses_host_cwd(terminal):
@@ -968,6 +983,7 @@ def restore_policy(data):
                 or not isinstance(policy.model, str) or not policy.model.strip()
                 or not isinstance(policy.toolsets, (list, tuple))
                 or any(not isinstance(name, str) for name in policy.toolsets)
+                or type(policy.evaluation_isolation) is not bool
                 or type(policy.safe_mode) is not bool or type(policy.ignore_user_config) is not bool
                 or not isinstance(policy.skills_prompt, (str, type(None)))
                 or type(policy.coding_posture) is not bool

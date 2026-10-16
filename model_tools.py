@@ -221,6 +221,9 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    from agent.evaluation_policy import active
+    if active():
+        return []  # includes deferred bridge controls; never populate the shared snapshot cache
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                          skip_tool_search_assembly=skip_tool_search_assembly)
@@ -886,6 +889,8 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from agent.evaluation_policy import refuse_effect
+    refuse_effect('tool dispatch')
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

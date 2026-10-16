@@ -765,6 +765,9 @@ class AIAgent(
         ``owed_session``/``owed_token`` (``carry_owed_reviews``) name the owed-review marker this review
         settles when it finishes (see agent/owed_review.py).
         """
+        from agent.evaluation_policy import active
+        if active(self):
+            return
         # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
             return
@@ -804,6 +807,9 @@ class AIAgent(
         memory operation set. A deferred review preempted by a live turn is requeued (bounded)
         rather than lost.
         """
+        from agent.evaluation_policy import active
+        if active(self):
+            return
         from agent.background_review import (
             finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
         )
@@ -1319,6 +1325,8 @@ class AIAgent(
         The segment planner splits the batch into runs of parallel-safe calls (read-only, non-overlapping file
         targets, opted-in MCP) separated by sequential barriers, run in emission order.
         """
+        from agent.evaluation_policy import refuse_effect
+        refuse_effect('tool dispatch', self)
         tool_calls = assistant_message.tool_calls
         args = (assistant_message, messages, effective_task_id, api_call_count)
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
