@@ -13,7 +13,9 @@ resumed once per wake by an orchestrator, a kanban worker):
   - the next turn of the **same session** folds the owed kinds into its own post-turn review (the
     snapshot is the whole conversation, so it covers the turns the lost review missed);
   - otherwise the next **one-shot run in the same profile** reviews it at exit, inside the existing exit
-    linger and its budget, from the transcript in ``state.db`` (one per run, oldest first).
+    linger and its budget, from the transcript in ``state.db`` (one per run, oldest first). A one-shot
+    turn the gateway runs (``chat -q`` / ``-z``) has no exit of its own: the gateway does the same after
+    that turn's own review (``background_review.schedule_owed_review_drain``).
 
   A turn that was itself interrupted while a review was due is owed the same way.
 
