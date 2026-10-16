@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -364,6 +365,57 @@ def drain_owed_review(agent: Any, *, budget: float) -> bool:
     if not finished:
         logger.warning("Owed review of session %s still running after %.0fs; left owed", session, budget)
     return bool(finished)
+
+
+def schedule_owed_review_drain(agent: Any, *, interrupted: bool = False) -> bool:
+    """``carry_owed_reviews`` on a finite gateway turn (``chat -q`` / ``-z`` run in the gateway).
+
+    The one-shot exit linger (``cli._linger_for_background_review``) pays another session's owed review
+    in the process that ran the turn. Once the turn runs in the gateway, that process is only a viewer
+    and the linger leaves the turn to the gateway, so nothing paid a debt whose session is never resumed
+    (a finished board run, a killed one). Here the gateway, which outlives the viewer, does what the
+    linger did: after THIS turn's own review has finished, pay ONE owed review of another session of the
+    profile (:func:`drain_owed_review`: oldest first, writer gone or stale, same budget and claim rules),
+    on a daemon thread so the turn's delivery is never held. An interrupted (stopped, disconnected) turn
+    does not start one. Returns True when the drain thread was started. Never raises.
+    """
+    try:
+        if agent is None or interrupted:
+            return False
+        from gateway.session_finite import finite_turn_required
+
+        if finite_turn_required() is not True:
+            return False  # a standalone one-shot drains at exit (cli.py); a live session pays its own debt
+        from agent import owed_review
+
+        enabled, task_cfg = load_background_review_settings()
+        if not enabled or not owed_review.applies(agent, task_cfg):
+            return False
+        from tools.thread_context import propagate_context_to_thread
+
+        def _drain() -> None:
+            try:
+                started = time.monotonic()
+                budget = drain_timeout_s()
+                run = getattr(agent, "_background_review_run", None)
+                done = getattr(run, "request_done", None)
+                if done is not None and not done.wait(budget):
+                    return  # this turn's own review is still running; a later turn tries again
+                if drain_owed_review(agent, budget=budget - (time.monotonic() - started)):
+                    logger.info("Finite gateway turn: owed review completed (session=%s)",
+                                getattr(agent, "session_id", None) or "<unknown>")
+            except Exception:  # best-effort, off the turn's path
+                logger.warning("Owed review drain after a finite gateway turn failed", exc_info=True)
+
+        # The thread keeps the turn's ContextVars: the profile home (markers, memory, skills) and the
+        # finite-turn scope that load_background_review_settings reads. propagate_context_to_thread also
+        # carries the turn's approval callbacks, which the nested review spawn captures in turn.
+        # health: allow HX012 -- propagate_context_to_thread is the context-carrying wrapper here
+        threading.Thread(target=propagate_context_to_thread(_drain), daemon=True, name="owed-review-drain").start()
+        return True
+    except Exception:  # never breaks the turn
+        logger.debug("Could not schedule an owed review drain", exc_info=True)
+        return False
 
 
 def oneshot_learning_enabled(task_cfg: Optional[dict[str, Any]] = None) -> bool:
