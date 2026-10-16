@@ -273,7 +273,7 @@ def drain_timeout_s() -> float:
     try:
         _enabled, task_cfg = load_background_review_settings()
         return max(0.0, float((task_cfg or {}).get("linger_timeout_s", _DRAIN_DEFAULT_S)))
-    except Exception:  # noqa: BLE001 — a bad knob must not break shutdown
+    except Exception:
         return _DRAIN_DEFAULT_S
 
 
@@ -317,6 +317,9 @@ def drain_owed_review(agent: Any, *, budget: float) -> bool:
     """``carry_owed_reviews``: at one-shot exit, review ONE other session of this profile whose review
     was owed and whose process is gone (killed, cancelled, or never resumed), from its transcript in
     ``state.db``, inside what is left of the exit-linger budget. Returns True when it finished."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return False
     if agent is None or budget < _OWED_MIN_BUDGET_S:
         return False
     from agent import owed_review
@@ -337,7 +340,7 @@ def drain_owed_review(agent: Any, *, budget: float) -> bool:
     try:
         messages = [m for m in (db.get_messages_as_conversation(session, repair_alternation=True) or [])
                     if m.get("role") != "session_meta"]
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("Owed review for session %s: transcript unreadable; left owed", session, exc_info=True)
         owed_review.release(session, token)
         return False
@@ -379,6 +382,9 @@ def schedule_owed_review_drain(agent: Any, *, interrupted: bool = False) -> bool
     on a daemon thread so the turn's delivery is never held. An interrupted (stopped, disconnected) turn
     does not start one. Returns True when the drain thread was started. Never raises.
     """
+    from agent.evaluation_policy import active
+    if active(agent):
+        return False
     try:
         if agent is None or interrupted:
             return False
@@ -418,7 +424,7 @@ def schedule_owed_review_drain(agent: Any, *, interrupted: bool = False) -> bool
         return False
 
 
-def oneshot_learning_enabled(task_cfg: Optional[Dict[str, Any]] = None) -> bool:
+def oneshot_learning_enabled(task_cfg: Optional[dict[str, Any]] = None) -> bool:
     """``auxiliary.background_review.oneshot_learning`` (default off).
 
     For installs whose one-shot runs are turns of a longer-lived identity (an orchestrator that
@@ -429,7 +435,7 @@ def oneshot_learning_enabled(task_cfg: Optional[Dict[str, Any]] = None) -> bool:
         from utils import is_truthy_value
 
         return is_truthy_value(_background_review_task_config(task_cfg).get("oneshot_learning"), default=False)
-    except Exception:  # noqa: BLE001 — a bad knob keeps the default
+    except Exception:
         return False
 
 
@@ -449,7 +455,7 @@ def turn_tool_call_count(messages: Any) -> int:
 
 
 def oneshot_memory_review_due(agent: Any, turn_tool_calls: int,
-                              task_cfg: Optional[Dict[str, Any]] = None) -> bool:
+                              task_cfg: Optional[dict[str, Any]] = None) -> bool:
     """True when a one-shot turn should get a memory review although the turn-count nudge did not fire.
 
     Needs ``oneshot_learning`` on, automatic reviews enabled, a single-query session, and a
@@ -470,7 +476,7 @@ def oneshot_memory_review_due(agent: Any, turn_tool_calls: int,
     return int(turn_tool_calls or 0) >= max(1, min_calls)
 
 
-def automatic_review_focus(task_cfg: Optional[Dict[str, Any]] = None) -> str:
+def automatic_review_focus(task_cfg: Optional[dict[str, Any]] = None) -> str:
     """``auxiliary.background_review.focus``: standing instructions appended to AUTOMATIC reviews
     (``/refine <text>`` supplies its own focus and wins). Empty when unset."""
     focus = _background_review_task_config(task_cfg).get("focus")

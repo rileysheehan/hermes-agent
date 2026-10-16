@@ -11,7 +11,7 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'evaluation_isolation'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -50,6 +50,7 @@ class LocalSessionPolicy:
     # `-s/--skills` blocks rendered once at creation (render_launch_skills): the session's
     # ephemeral prompt never re-reads the skill files, like the CLI's startup preload.
     skills_prompt: str | None = None
+    evaluation_isolation: bool = False
 
     def config(self, authority=None, *, secrets=True):
         return self.effective(authority, secrets=secrets)[0]
@@ -251,6 +252,19 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True)
     from hermes_constants import get_hermes_home
 
     source = params.get('source', 'cli')
+    evaluation = 'evaluation_isolation' in params
+    if evaluation:
+        if (type(params['evaluation_isolation']) is not int or params['evaluation_isolation'] != 1
+                or source != 'oneshot' or any(params.get(k) for k in (
+                    'safe_mode', 'ignore_user_config', 'ignore_rules', 'editor', 'skills',
+                    'checkpoints', 'accept_hooks', 'follow_profile_config'))
+                or (config.get('gateway') or {}).get('managed_workers') is True):
+            raise RuntimeStoreError('evaluation_policy_locked')
+        from agent.evaluation_policy import require_provider, EvaluationIsolationError
+        try:
+            require_provider(get_hermes_home(), config)
+        except (OSError, EvaluationIsolationError) as exc:
+            raise RuntimeStoreError('evaluation_isolation_unproven') from exc
     if source == 'a2a':
         from gateway.session_a2a import build_forward_policy
         return build_forward_policy(params, config, private_secrets=private_secrets)
@@ -293,7 +307,8 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True)
     _extract_config_secrets(terminal, private_secrets, (None,))
     return LocalSessionPolicy(source, SURFACES[source], cwd, model, tuple(sorted(enabled)),
                               json.dumps(config), json.dumps(request, sort_keys=True), json.dumps(terminal),
-                              safe_mode=safe_mode, ignore_user_config=ignore_user_config)
+                              safe_mode=safe_mode, ignore_user_config=ignore_user_config,
+                              evaluation_isolation=evaluation)
 
 
 def _profile_workspace_cwd(home):
@@ -612,6 +627,7 @@ def restore_policy(data):
                 or not isinstance(policy.model, str) or not policy.model.strip()
                 or not isinstance(policy.toolsets, (list, tuple))
                 or any(not isinstance(name, str) for name in policy.toolsets)
+                or type(policy.evaluation_isolation) is not bool
                 or type(policy.safe_mode) is not bool or type(policy.ignore_user_config) is not bool
                 or not isinstance(policy.skills_prompt, (str, type(None)))
                 or (policy.safe_mode and not policy.ignore_user_config)):

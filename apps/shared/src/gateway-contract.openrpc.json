@@ -8572,6 +8572,18 @@
             "title": "Source",
             "type": "string"
           },
+          "evaluation_isolation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Evaluation Isolation"
+          },
           "cwd": {
             "anyOf": [
               {
@@ -10744,6 +10756,19 @@
             "default": null,
             "title": "Launch Request"
           },
+          "evaluation_isolation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Evaluation Isolation"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -11057,6 +11082,21 @@
             "default": false,
             "title": "Clarify Batch",
             "type": "boolean"
+          },
+          "client_env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Env"
           }
         },
         "required": [

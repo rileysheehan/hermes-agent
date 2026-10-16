@@ -194,6 +194,12 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     from gateway.session_local_recovery import local_identity, restore_local_session
     authority._require_admission_open()
     sid = local_identity(authority.profile_id, actor.subject, request_id)
+    if policy.evaluation_isolation:
+        from agent.evaluation_policy import enroll, EvaluationIsolationError
+        try:
+            enroll(authority.profile_id, sid)
+        except (OSError, EvaluationIsolationError) as exc:
+            raise RuntimeStoreError('evaluation_isolation_unproven') from exc
     from gateway.session_policy import bind_launch_key, restore_policy, launch_key
     if authority.db.get_session(sid) is not None:
         from hermes_state_local import local_receipt
@@ -308,6 +314,8 @@ def local_session_info(authority, ref):
         # resuming client can tell "same flags again" from a real override attempt.
         import json
         info['launch_request'] = json.loads(policy.request_json)
+    from gateway.session_evaluation import proof
+    info.update(proof(authority, ref, policy))
     info.update(_classic_cli_fields(authority, ref, live, agent, policy))
     return info
 
