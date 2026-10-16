@@ -522,6 +522,37 @@ def apply_llm_output_transform(
     return final_response, transformed, pre_transform
 
 
+def _spawn_post_turn_reviews(agent, messages, final_response, interrupted, review_memory, review_skills,
+                             owed_session, owed_token) -> None:
+    """The turn's own post-turn review, then (finite gateway turn) one review another session owes."""
+    # Background memory/skill review runs AFTER delivery so it never competes with the
+    # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
+    # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
+    # clones the snapshot structurally so its sanitizers can't reach the live transcript.
+    if (
+        final_response
+        and not interrupted
+        and not getattr(agent, "skip_background_review", False)
+        and (review_memory or review_skills)
+    ):
+        with suppress(Exception):
+            _owed_kwargs = dict(owed_session=owed_session, owed_token=owed_token) if owed_token else {}
+            agent._spawn_background_review(
+                messages_snapshot=list(messages), review_memory=review_memory,
+                review_skills=review_skills, **_owed_kwargs,
+            )
+
+    # ``carry_owed_reviews`` on a finite gateway turn: the one-shot exit linger no longer runs in the
+    # turn's process, so the gateway pays ONE review another session of this profile still owes, after
+    # this turn's own review (so the wait sees it). A no-op outside a finite gateway turn and for cron
+    # (owed_review.applies); never breaks the turn.
+    if owed_session:
+        with suppress(Exception):
+            from agent.background_review import schedule_owed_review_drain
+
+            schedule_owed_review_drain(agent, interrupted=bool(interrupted or not final_response))
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -828,22 +859,8 @@ def finalize_turn(
                 if oneshot_learning():
                     owed_review.carry(_owed_session, _owed_turn_calls)
 
-    # Background memory/skill review runs AFTER delivery so it never competes with the
-    # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
-    # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
-    # clones the snapshot structurally so its sanitizers can't reach the live transcript.
-    if (
-        final_response
-        and not interrupted
-        and not getattr(agent, "skip_background_review", False)
-        and (_should_review_memory or _should_review_skills)
-    ):
-        with suppress(Exception):
-            _owed_kwargs = dict(owed_session=_owed_session, owed_token=_owed_token) if _owed_token else {}
-            agent._spawn_background_review(
-                messages_snapshot=list(messages), review_memory=_should_review_memory,
-                review_skills=_should_review_skills, **_owed_kwargs,
-            )
+    _spawn_post_turn_reviews(agent, messages, final_response, interrupted, _should_review_memory,
+                             _should_review_skills, _owed_session, _owed_token)
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
