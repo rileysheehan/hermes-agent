@@ -194,12 +194,8 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     from gateway.session_local_recovery import local_identity, restore_local_session
     authority._require_admission_open()
     sid = local_identity(authority.profile_id, actor.subject, request_id)
-    if policy.evaluation_isolation:
-        from agent.evaluation_policy import enroll, EvaluationIsolationError
-        try:
-            enroll(authority.profile_id, sid)
-        except (OSError, EvaluationIsolationError) as exc:
-            raise RuntimeStoreError('evaluation_isolation_unproven') from exc
+    # Enrollment belongs to the creation commit, after all conflict checks and
+    # under the same writer lock. Staging may race another creator's commit.
     from gateway.session_policy import bind_launch_key, restore_policy, launch_key
     if authority.db.get_session(sid) is not None:
         from hermes_state_local import local_receipt
