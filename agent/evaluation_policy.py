@@ -51,6 +51,27 @@ def enrolled(home, session_id):
         return False
 
 
+def require_unenrolled(home, session_id):
+    """A fresh ordinary creation needs proved absence, not failed enrollment proof.
+
+    Enrollment is monotonic and outside SQLite's rollback. A failed/crashed
+    evaluation may leave only its marker: keep that identity quarantined rather
+    than publish production with retention silently disabled. Legacy IDs use the
+    companion provider's safe filename alphabet, not the evaluation-only format.
+    """
+    if (not isinstance(session_id, str) or session_id in {'.', '..'}
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+', session_id)):
+        raise EvaluationIsolationError('ordinary session identity is unproven')
+    path = Path(home) / 'hindsight/read-only-sessions' / session_id
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise EvaluationIsolationError('ordinary session enrollment absence is unproven') from exc
+    raise EvaluationIsolationError('enrolled identity cannot become an ordinary session')
+
+
 def enroll(home, session_id):
     """Owner enrolls before publishing creation. No provider/model is constructed."""
     path = marker_path(home, session_id)
