@@ -56,15 +56,7 @@ def commit_local_session(db, *, epoch, receipt):
         policy, entry = receipt['policy'], receipt['entry']
         from datetime import datetime
         started = datetime.fromisoformat(entry['created_at']).timestamp()
-        if policy.get('evaluation_isolation') is True:
-            # Both sync and async creators reach this serialized decision. A
-            # refused retry must not mark the winner's production session;
-            # a fresh evaluation is still enrolled before commit/publication.
-            from agent.evaluation_policy import enroll, EvaluationIsolationError
-            try:
-                enroll(receipt['profile_id'], sid)
-            except (OSError, EvaluationIsolationError) as exc:
-                raise RuntimeStoreError('evaluation_isolation_unproven') from exc
+        _enroll_creation_policy(receipt)
         # Auxiliary usage inserts created_source='unknown' when it creates the row
         # (record_auxiliary_usage carries no surface). The creator upsert repairs
         # 'unknown', but this DO NOTHING insert does not, so the surface is stamped here.
@@ -131,6 +123,21 @@ def same_create_retry(saved_policy, retry_json, client_request):
     the attempt that holds the session's key slot."""
     from agent.session_client_env import retry_matches
     return same_create_request(saved_policy['request_json'], retry_json) and retry_matches(saved_policy, client_request)
+
+
+def _enroll_creation_policy(receipt):
+    """Run under the creation writer lock, after conflicts and before publication.
+
+    The marker and SQLite are not one transaction: failed enrollment/storage or a
+    dead creator may leave a marker without a receipt. Only evaluation can recover
+    that identity; never remove the marker to make production appear writable.
+    """
+    from agent.evaluation_policy import enroll, require_unenrolled, EvaluationIsolationError
+    try:
+        check = enroll if receipt['policy'].get('evaluation_isolation') is True else require_unenrolled
+        check(receipt['profile_id'], receipt['session_id'])
+    except (OSError, EvaluationIsolationError) as exc:
+        raise RuntimeStoreError('evaluation_isolation_unproven') from exc
 
 
 def _row_cwd(policy):
