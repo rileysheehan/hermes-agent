@@ -439,6 +439,12 @@ class GatewayChatView:
                 from hermes_cli.oneshot import _oneshot_exit_code
                 from hermes_cli.turn_exit import turn_exit_code
                 result = await self._settled_result(admission)
+                # The normal platform send may be suppressed after streaming already delivered
+                # the reply, leaving terminal-event text empty. The owner's committed receipt
+                # is admission-bound and carries the raw run_conversation answer; it is not a
+                # transcript reconstruction or an inference from a successful usage ledger.
+                from hermes_cli.gateway_finite_result import admission_answer
+                text = admission_answer(result, text)
                 result.update(failed=bool(result.get("failed")) or outcome not in ("completed", "cancelled"),
                               interrupted=bool(result.get("interrupted")) or outcome == "cancelled")
                 exit_code = (_oneshot_exit_code(text, result) if self.unattended

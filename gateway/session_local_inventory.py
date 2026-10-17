@@ -125,6 +125,9 @@ def session_inventory(authority, policy, agent, cwd):
     info: dict = {"tools": {}, "skills": {}, "mcp_servers": [], "version": "", "release_date": "",
                   "update_behind": None, "update_command": "",
                   "branch": git_probe.branch(cwd) if cwd else "", "project": _project(cwd)}
+    if policy is not None and policy.evaluation_isolation:
+        info.update(provider=policy.provider or '', enabled_toolsets=[])
+        return info  # no discovery/check_fn side effects before the first evaluation prompt
     with owner_scope(authority):
         config = policy.config(authority, secrets=False) if policy is not None else {}
         if agent is not None:

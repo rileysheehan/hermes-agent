@@ -53,20 +53,23 @@ MAX_ATTEMPTS = 3
 CARRY_TTL_S = 14 * 24 * 3600
 
 
-def enabled(task_cfg: Optional[Dict[str, Any]] = None) -> bool:
+def enabled(task_cfg: Optional[dict[str, Any]] = None) -> bool:
     """``auxiliary.background_review.carry_owed_reviews`` (default off). Never raises."""
     try:
         from agent.background_review import _background_review_task_config
         from utils import is_truthy_value
 
         return is_truthy_value(_background_review_task_config(task_cfg).get("carry_owed_reviews"), default=False)
-    except Exception:  # noqa: BLE001 — a bad knob keeps the default
+    except Exception:
         return False
 
 
-def applies(agent: Any, task_cfg: Optional[Dict[str, Any]] = None) -> bool:
+def applies(agent: Any, task_cfg: Optional[dict[str, Any]] = None) -> bool:
     """True when this agent's automatic reviews are carried: opted in, a top-level persisted session,
     and not a caller that suppresses reviews (cron)."""
+    from agent.evaluation_policy import active
+    if active(agent):
+        return False
     if agent is None or not getattr(agent, "session_id", None):
         return False
     if getattr(agent, "skip_background_review", False) or getattr(agent, "_delegate_depth", 0) > 0:
@@ -78,7 +81,7 @@ def applies(agent: Any, task_cfg: Optional[Dict[str, Any]] = None) -> bool:
 
         reviews_on, cfg = load_background_review_settings() if task_cfg is None else (True, task_cfg)
         return bool(reviews_on) and enabled(cfg)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -102,7 +105,7 @@ def _lock():
     return skill_file_lock(marker_dir() / ".lock")
 
 
-def _read(path: Path) -> Optional[Dict[str, Any]]:
+def _read(path: Path) -> Optional[dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -110,7 +113,7 @@ def _read(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def _write(path: Path, data: Dict[str, Any], *, pid: Optional[int] = None) -> None:
+def _write(path: Path, data: dict[str, Any], *, pid: Optional[int] = None) -> None:
     from hermes_constants import mkdir_under_hermes_home
 
     mkdir_under_hermes_home(path.parent)
@@ -141,11 +144,11 @@ def _pid_alive(pid: Any) -> bool:
     return True
 
 
-def _is_owed(data: Optional[Dict[str, Any]]) -> bool:
+def _is_owed(data: Optional[dict[str, Any]]) -> bool:
     return bool(data) and bool(data.get("memory") or data.get("skills"))
 
 
-def read(session_id: str) -> Optional[Dict[str, Any]]:
+def read(session_id: str) -> Optional[dict[str, Any]]:
     if not session_id:
         return None
     return _read(_path(session_id))
@@ -154,7 +157,7 @@ def read(session_id: str) -> Optional[Dict[str, Any]]:
 # ── the owed marker ───────────────────────────────────────────────────────────
 
 
-def owed_kinds(session_id: str) -> Tuple[bool, bool]:
+def owed_kinds(session_id: str) -> tuple[bool, bool]:
     """``(memory, skills)`` still owed for this session; ``(False, False)`` once the attempt cap is hit
     (the marker stays for monitoring)."""
     data = read(session_id) or {}
@@ -189,7 +192,7 @@ def mark_owed(session_id: str, *, memory: bool, skills: bool, reason: str, spawn
         logger.info("Review owed: session=%s memory=%s skills=%s reason=%s attempts=%d",
                     session_id, data["memory"], data["skills"], reason, data["attempts"])
         return token
-    except Exception:  # noqa: BLE001 — bookkeeping must never break a turn
+    except Exception:
         logger.debug("Could not record owed review for %s", session_id, exc_info=True)
         return None
 
@@ -214,7 +217,7 @@ def settle(session_id: Optional[str], token: Optional[str]) -> bool:
                 path.unlink(missing_ok=True)
         logger.info("Owed review settled: session=%s", session_id)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("Could not settle owed review for %s", session_id, exc_info=True)
         return False
 
@@ -232,7 +235,7 @@ def touch(session_id: str) -> None:
             data = _read(path)
             if data:
                 _write(path, data)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("Could not touch owed review for %s", session_id, exc_info=True)
 
 
@@ -260,7 +263,7 @@ def carry(session_id: str, tool_calls: int) -> int:
             _write(path, data)
         logger.debug("Short run carried: session=%s tool_calls=+%d total=%d", session_id, tool_calls, total)
         return total
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("Could not carry tool calls for %s", session_id, exc_info=True)
         return 0
 
@@ -268,7 +271,7 @@ def carry(session_id: str, tool_calls: int) -> int:
 # ── another session's debt ────────────────────────────────────────────────────
 
 
-def claim_orphan(exclude: Optional[str] = None, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+def claim_orphan(exclude: Optional[str] = None, *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
     """Take over the oldest owed review whose writer is gone (or which is older than
     ``ORPHAN_AFTER_S``), stamping this pid and a fresh token. Prunes stale carry-only markers while
     scanning. Returns the claimed marker, or ``None``."""
@@ -304,7 +307,7 @@ def claim_orphan(exclude: Optional[str] = None, *, now: Optional[float] = None) 
         logger.info("Claimed owed review: session=%s memory=%s skills=%s attempts=%d",
                     data.get("session_id"), data.get("memory"), data.get("skills"), data["attempts"])
         return data
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("Could not scan owed reviews", exc_info=True)
         return None
 

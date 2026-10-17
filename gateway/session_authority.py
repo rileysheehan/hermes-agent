@@ -427,7 +427,9 @@ class SessionAuthority:
 
     async def _submit(self, actor, request, *, _authorize_write=None):
         self._require_admission_open()
-        if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
+        from gateway.session_evaluation import guard_submit
+        guard_submit(self, actor, request)
+        if (request.intent != 'queue'  or not {'text'} <= set(request.payload) <= {
                 'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
                 'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
                 or not isinstance(request.payload['text'], str)):

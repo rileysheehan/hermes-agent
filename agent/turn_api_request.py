@@ -102,6 +102,8 @@ def build_api_request(
         _moa_client_consumes_prepared_request, _redecorate_prompt_cache_for_provider,
     )
 
+    from agent.evaluation_policy import assert_request
+    assert_request(agent, tools_for_api)
     agent._reset_stream_delivery_tracking()
     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
     agent._last_api_first_chunk_at = None
@@ -163,6 +165,7 @@ def build_api_request(
         effective_task_id=effective_task_id, turn_id=turn_id,
     )
 
+    assert_request(agent, api_kwargs.get('tools'))
     if env_var_enabled("HERMES_DUMP_REQUESTS"):
         agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
