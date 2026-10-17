@@ -56,6 +56,15 @@ def commit_local_session(db, *, epoch, receipt):
         policy, entry = receipt['policy'], receipt['entry']
         from datetime import datetime
         started = datetime.fromisoformat(entry['created_at']).timestamp()
+        if policy.get('evaluation_isolation') is True:
+            # Both sync and async creators reach this serialized decision. A
+            # refused retry must not mark the winner's production session;
+            # a fresh evaluation is still enrolled before commit/publication.
+            from agent.evaluation_policy import enroll, EvaluationIsolationError
+            try:
+                enroll(receipt['profile_id'], sid)
+            except (OSError, EvaluationIsolationError) as exc:
+                raise RuntimeStoreError('evaluation_isolation_unproven') from exc
         # Auxiliary usage inserts created_source='unknown' when it creates the row
         # (record_auxiliary_usage carries no surface). The creator upsert repairs
         # 'unknown', but this DO NOTHING insert does not, so the surface is stamped here.
