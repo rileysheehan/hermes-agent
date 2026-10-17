@@ -45,15 +45,7 @@ def commit_local_session(db, *, epoch, receipt):
         policy, entry = receipt['policy'], receipt['entry']
         from datetime import datetime
         started = datetime.fromisoformat(entry['created_at']).timestamp()
-        if policy.get('evaluation_isolation') is True:
-            # Both sync and async creators reach this serialized decision. A
-            # refused retry must not mark the winner's production session;
-            # a fresh evaluation is still enrolled before commit/publication.
-            from agent.evaluation_policy import enroll, EvaluationIsolationError
-            try:
-                enroll(receipt['profile_id'], sid)
-            except (OSError, EvaluationIsolationError) as exc:
-                raise RuntimeStoreError('evaluation_isolation_unproven') from exc
+        _enroll_creation_policy(receipt)
         conn.execute('''INSERT INTO sessions(id,source,user_id,session_key,chat_id,chat_type,
             model,cwd,profile_name,origin_json,started_at) VALUES(?,?,?,?,?,'dm',?,?,?,?,?)
             ON CONFLICT(id) DO NOTHING''',
@@ -64,6 +56,21 @@ def commit_local_session(db, *, epoch, receipt):
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encoded))
         return receipt
     return db._execute_write(write)
+
+
+def _enroll_creation_policy(receipt):
+    """Run under the creation writer lock, after conflicts and before publication.
+
+    The marker and SQLite are not one transaction: failed enrollment/storage or a
+    dead creator may leave a marker without a receipt. Only evaluation can recover
+    that identity; never remove the marker to make production appear writable.
+    """
+    from agent.evaluation_policy import enroll, require_unenrolled, EvaluationIsolationError
+    try:
+        check = enroll if receipt['policy'].get('evaluation_isolation') is True else require_unenrolled
+        check(receipt['profile_id'], receipt['session_id'])
+    except (OSError, EvaluationIsolationError) as exc:
+        raise RuntimeStoreError('evaluation_isolation_unproven') from exc
 
 
 def _row_cwd(policy):
