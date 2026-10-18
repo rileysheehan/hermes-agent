@@ -323,7 +323,8 @@ def _finalize_child_env(env: dict) -> dict:
     strip_supervised_process_identity(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    from agent.managed_authority import exclude_parent_authority
+    return exclude_parent_authority(delegated_child_subprocess_env(env))
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -433,7 +434,8 @@ def build_subprocess_env(
         env.update(extra)
     strip_supervised_process_identity(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    from agent.managed_authority import exclude_parent_authority
+    return exclude_parent_authority(delegated_child_subprocess_env(env))
 
 
 def served_profile_child_env(
@@ -481,7 +483,8 @@ def served_profile_child_env(
         if not (_is_routed_home(target) if target else secrets is not None):
             _restore_bootstrap_tokens(env, os.environ if base is None else base)
     _carry_bridge_markers(env, base if base is not None else os.environ, own_profile=not routed)
-    return env
+    from agent.managed_authority import exclude_parent_authority
+    return exclude_parent_authority(env)
 
 
 def _carry_bridge_markers(env: dict, source: Mapping[str, str], *, own_profile: bool) -> None:

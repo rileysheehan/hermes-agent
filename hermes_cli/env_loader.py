@@ -16,6 +16,7 @@ from pathlib import Path
 # The parser internals are imported lazily below because gateway tests stub ``sys.modules["dotenv"]``.
 import dotenv
 from hermes_constants import hermes_home_key, is_launch_only_env_key
+from agent.managed_authority import authority_scoped_startup
 from hermes_cli.left_core_migration import profile_env_names
 from utils import atomic_replace, mkstemp_beside
 
@@ -745,6 +746,7 @@ def _load_user_dotenv(path: Path, *, load_pass: int) -> bool:
     return True
 
 
+@authority_scoped_startup
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
