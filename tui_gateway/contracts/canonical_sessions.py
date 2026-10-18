@@ -43,6 +43,8 @@ class CanonicalCreateParams(ProfileParams):
     pass_session_id: bool = False
     editor: dict[str, JsonValue] | None = None
     title: str | None = None
+    # Refuse reuse of a title/creation identity; title is committed with the new row.
+    fresh_only: bool = False
     hidden: bool = False
     follow_profile_config: bool | None = None
     service_tier: str | None = None

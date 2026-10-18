@@ -298,6 +298,8 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     # under the same writer lock. Staging may race another creator's commit.
     from gateway.session_policy import bind_launch_key, restore_policy, launch_key
     if authority.db.get_session(sid) is not None:
+        if params.get('fresh_only') is True:
+            raise RuntimeStoreError('admission_conflict')
         from hermes_state_local import local_receipt
         saved = local_receipt(authority.db, sid)
         original = restore_policy(saved['policy'])

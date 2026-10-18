@@ -30,6 +30,8 @@ def commit_local_session(db, *, epoch, receipt):
         _epoch(conn, epoch)
         old = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
         if old is not None:
+            if json.loads(receipt['policy']['request_json']).get('fresh_only') is True:
+                raise RuntimeStoreError('admission_conflict')
             try:
                 saved = json.loads(old[0])
                 same = all(saved[k] == receipt[k] for k in (
@@ -40,6 +42,17 @@ def commit_local_session(db, *, epoch, receipt):
             if not same:
                 raise RuntimeStoreError('invalid_params')
             return saved
+        fresh = json.loads(receipt['policy']['request_json']).get('fresh_only') is True
+        title = receipt.get('fresh_title')
+        if fresh:
+            from hermes_state_common import escape_like
+            if not isinstance(title, str) or db.sanitize_title(title) != title:
+                raise RuntimeStoreError('invalid_params')
+            # Refuse all matching rows, including hidden/foreign/empty/archived rows. Never
+            # borrow the ordinary title setter's ghost reclamation or disclose a row identity.
+            if conn.execute("SELECT 1 FROM sessions WHERE id=? OR title=? OR title LIKE ? ESCAPE '\\' LIMIT 1",
+                            (title, title, escape_like(title) + ' #%')).fetchone():
+                raise RuntimeStoreError('admission_conflict')
         from hermes_state_mutation_retirement import RETIRED_PREFIX
         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + sid,)).fetchone():
             # Deleted: its receipt was retired with the transcript; a create/cron retry must not
@@ -71,6 +84,9 @@ def commit_local_session(db, *, epoch, receipt):
             (sid, policy['source'], created, receipt['principal_id'], route,
              entry['origin']['chat_id'], policy['model'], _row_cwd(policy), db._own_profile_name(),
              _json(entry['origin']), started))
+        if fresh:
+            conn.execute('UPDATE sessions SET title=?, title_source=? WHERE id=?',
+                         (title, db.TITLE_SOURCE_USER, sid))
         conn.execute("INSERT INTO gateway_routing(scope,session_key,entry_json,updated_at) VALUES('',?,?,?)",
                      (route, _json(entry), started))
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encoded))
