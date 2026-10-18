@@ -388,12 +388,26 @@ def _prompt_frame(authority, ref, row, worker, frame):
     return True
 
 
-def _worker_env(authority):
-    """Child env for the OWNING profile under multiplex: its HERMES_HOME plus its ``.env``
-    secrets over a scrubbed base, never the launch profile's process environment (the same
-    rule MCP stdio children and shell hooks follow) — except for the launch profile's own
-    worker, whose scope legitimately includes its frozen launch env. Single-profile gateways
-    inherit the process env byte-for-byte, exactly as before."""
+def _worker_env(authority, policy=None):
+    """The owning profile's environment; explicit exclusion is applied after every overlay."""
+    from agent.managed_authority import exclude_parent_authority
+    from gateway.session_policy import active_policy
+    policy = policy if policy is not None else active_policy()
+    excluded = policy is not None and json.loads(policy.request_json).get('exclude_parent_authority') is True
+    env = _profile_worker_env(authority)
+    if not excluded:
+        return env
+    if not Path(str(authority.profile_id)).is_absolute():
+        raise RuntimeStoreError('authority_exclusion_unproven')
+    env = os.environ.copy() if env is None else env
+    env['HERMES_HOME'] = str(authority.profile_id)
+    from hermes_constants import apply_subprocess_home_env
+    apply_subprocess_home_env(env)
+    return exclude_parent_authority(env, enabled=True)
+
+
+def _profile_worker_env(authority):
+    """Existing owning-profile routing and provider-secret policy, unchanged by default."""
     from pathlib import Path
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import _is_routed_home
@@ -452,7 +466,8 @@ def _interrupted_before_bootstrap(authority, row):
 async def execute_managed(authority, ref, row, policy):
     from gateway.run_turn_progress import publish_worker_tool_event
     try:
-        env = await asyncio.to_thread(_worker_env, authority)
+        excluded = policy is not None and json.loads(policy.request_json).get('exclude_parent_authority') is True
+        env = await asyncio.to_thread(_worker_env, authority, **({'policy': policy} if excluded else {}))
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
