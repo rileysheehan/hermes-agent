@@ -111,6 +111,11 @@ def bind_worker_policy(frame):
     server definitions included). Ordinary sessions keep plugins, MCP and hooks; bypass sessions
     also bind the safe / ignore-user-config policy.
     """
+    request = json.loads(frame['policy'].get('request_json', '{}'))
+    if request.get('exclude_parent_authority') is True:
+        from agent.managed_authority import exclusion_enabled
+        if not exclusion_enabled():
+            raise ValueError('authority_exclusion_unproven')
     config = json.loads(frame['policy']['config_json'])
     if not frame['ignore_user_config']:
         from agent.safe_worker_policy import _bind_worker_config

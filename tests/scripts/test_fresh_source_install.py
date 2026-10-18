@@ -74,7 +74,7 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
     # out so the tail cannot grow a dependency on the agent runtime.
     (source / "agent").mkdir()
     for name in ("__init__.py", "jiter_preload.py", "i18n.py", "i18n_layers.py", "i18n_languages.py",
-                 "safe_worker_policy.py"):
+                 "safe_worker_policy.py", "managed_authority.py"):
         shutil.copy2(ROOT / "agent" / name, source / "agent" / name)
     (source / "locales").mkdir()
     shutil.copy2(ROOT / "locales/en.yaml", source / "locales/en.yaml")

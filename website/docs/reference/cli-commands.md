@@ -131,6 +131,27 @@ original request identity read-only; do not send a query until freshness and
 policy are established. This option changes no ordinary resume/idempotency
 semantics and does not change profile models, tools or capacity defaults.
 
+For a fresh finite config-only implementation task, additionally opt into
+`--exclude-parent-authority --ignore-user-config --ignore-rules`. The owner
+requires `source: oneshot`, `fresh_only`, explicit config/rule bypass and no
+profile-following/editor/launch-skills/hooks. Unsupported combinations refuse.
+Only this assignment's managed environment is changed: parent `PAPERCLIP_*`,
+resume-prefix markers, Kanban task/run/claim and inherited process-wide yolo
+are removed after owner profile/client overlays. Native admission identity and
+provider access retain their existing route. The private bootstrap refuses a
+missing exclusion marker; native terminal/served children and native dotenv
+startup reapply the denial after overlays. Ordinary sessions are unchanged.
+This is cooperative ambient-authority exclusion, not protection against trusted
+code reading host credential files or deliberately constructing another env.
+Toolsets remain a separate scope: inspect full plugin and deferred-tool catalog,
+not only eager schemas. Explicitly supply required repository/approval rules
+in the focused task when automatic context is omitted.
+
+A client exit is not settlement. Supervise the exact native admission/generation,
+use native interruption, retain partial/failed/unknown outcomes and verify the
+owned process birth/group and any registered terminal children are gone before
+releasing a worktree. Never stop a shared gateway to clean up a task.
+
 ```bash
 hermes chat [options]
 ```

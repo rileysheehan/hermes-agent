@@ -101,3 +101,19 @@ def test_fresh_only_cannot_be_dropped_by_ordinary_cli_dispatch(tmp_path, monkeyp
     with pytest.raises(SystemExit) as exc:
         main.cmd_chat(args)
     assert exc.value.code == 0 and calls == [True]
+
+
+def test_exclusion_request_cannot_be_lost_by_client(tmp_path):
+    args = arguments(tmp_path)
+    parsed = main._light_chat_parser().parse_args(['chat', '--exclude-parent-authority'])
+    args.exclude_parent_authority = parsed.exclude_parent_authority
+    assert gateway_chat._requested_policy(args).get('exclude_parent_authority') is True
+
+
+@pytest.mark.parametrize('missing', ['fresh_only', 'ignore_user_config', 'ignore_rules'])
+def test_exclusion_client_refuses_unsupported_launch_policy(tmp_path, missing):
+    args = arguments(tmp_path)
+    args.exclude_parent_authority = True
+    setattr(args, missing, False)
+    with pytest.raises(gateway_chat.GatewayClientError, match='exclude-parent-authority'):
+        gateway_chat.validate_options(args)
