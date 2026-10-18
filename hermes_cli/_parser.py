@@ -282,6 +282,9 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "'--resume latest' / -c lookups to DIR's workspace)."))
     add("--continue", "-c", dest="continue_last", nargs="?", const=True, default=SUPPRESS,
         metavar="SESSION_NAME", help="Resume a session by name, or the most recent if no name given")
+    add("--fresh-only", action="store_true", default=SUPPRESS, help=(
+        "With -c <name> --create-if-missing: refuse any existing title or creation identity; "
+        "never resume. Requires an owner advertising fresh_only. Uncertain creation is not retried."))
     add("--create-if-missing", action="store_true", default=SUPPRESS, help=(
         "With -c/--continue <name>: if no session matches the name, "
         "create a new session with that title and proceed (instead of "

@@ -284,6 +284,10 @@ class AuthorityConnection:
     async def create(self, ref, params):
         from gateway.session_local_title import validate_title
         title = validate_title(params.pop('title')) if 'title' in params else None
+        if 'fresh_only' in params and type(params['fresh_only']) is not bool:
+            raise RuntimeStoreError('invalid_params')
+        if params.get('fresh_only') is True and title is None:
+            raise RuntimeStoreError('invalid_params')
         if 'evaluation_isolation' in params and not title:
             raise RuntimeStoreError('evaluation_policy_locked')
         if title is None:
@@ -307,7 +311,14 @@ class AuthorityConnection:
         hidden = params.pop('hidden', False)
         if type(hidden) is not bool:
             raise RuntimeStoreError('invalid_params')
-        ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
+        fresh = params.get('fresh_only') is True
+        if fresh:
+            self.authority._require_admission_open()
+            if 'session:create' not in self.actor.capabilities:
+                raise RuntimeStoreError('permission_denied')
+        # Fresh creation never resolves a title to a readable/foreign session. The final
+        # decision (all rows, including hidden/foreign) belongs to the SQLite writer.
+        ref = None if fresh else title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
         if ref and 'evaluation_isolation' in params:
             raise RuntimeStoreError('evaluation_policy_locked')
         if not ref:
@@ -326,6 +337,8 @@ class AuthorityConnection:
                 # The creation commit runs off the owner loop: a held writer must not freeze
                 # every session behind one new chat (N50).
                 receipt = ref
+                if params.get('fresh_only') is True:
+                    receipt['fresh_title'] = title
                 await tracked_write(self.authority, partial(
                     commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=receipt))
                 ref = restore_local_session(self.authority, receipt['session_id'])
@@ -334,7 +347,7 @@ class AuthorityConnection:
                 from hermes_state_local import local_receipt
                 policy = restore_policy(local_receipt(self.authority.db, ref.session_id)['policy'])
                 await asyncio.to_thread(accept_launch_hooks, policy)
-            if title:
+            if title and not params.get('fresh_only'):
                 await tracked_write(self.authority, partial(title_new_session, self.authority, ref, title))
             if hidden:
                 await tracked_write(self.authority, partial(self.authority.db.set_session_hidden, ref.session_id, True))

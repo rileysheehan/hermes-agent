@@ -19,7 +19,7 @@ _UNSUPPORTED = (
     "run_budget", "verbose", "compact",
 )
 _POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "base_url", "ignore_rules", "api_key",
-           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id")
+           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id", "fresh_only")
 # Where each refused option lives now; the refusal names it so the user is not left guessing.
 _RELOCATED = {
     "image": "`hermes --tui` or the Desktop app to attach the image",
@@ -70,6 +70,9 @@ def wants_latest(args):
 
 
 def validate_options(args):
+    if getattr(args, 'fresh_only', False) and not (
+            continue_title(args) and getattr(args, 'create_if_missing', False)):
+        raise GatewayClientError('--fresh-only requires -c <name> --create-if-missing; it never resumes.')
     unsupported = [name for name in _UNSUPPORTED if getattr(args, name, None)]
     if getattr(args, "create_if_missing", False) and not continue_title(args):
         unsupported.append("create-if-missing without -c <name>")
@@ -200,7 +203,7 @@ async def run_gateway_chat(args, emitter=None):
             missing = sorted(set(policy) - set(parameters))
             if missing:
                 raise GatewayClientError("Gateway does not support creation options: " + ", ".join(missing))
-            snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
+            snapshot = await create_session(client, args, source, policy)
         if not isinstance(oneshot_prompt, str):  # main's -z writes nothing to stderr on success
             print("Session: " + snapshot["stored_session_id"], file=sys.stderr, flush=True)
         if not oneshot:
@@ -218,6 +221,25 @@ async def run_gateway_chat(args, emitter=None):
                 if row.get("role") in {"user", "assistant"} and isinstance(row.get("content"), str):
                     print(f"{row['role']}: {row['content']}")
         return await view.run(query, oneshot=oneshot)
+
+
+async def create_session(client, args, source, policy):
+    """One creation attempt. A pre-dispatch id survives a lost reply for read-only reconciliation."""
+    request_id = uuid.uuid4().hex
+    fresh = getattr(args, 'fresh_only', False)
+    if fresh:
+        print('Creation request: ' + request_id, file=sys.stderr, flush=True)
+    snapshot = await client.rpc('session.create', request_id=request_id, source=source, **policy)
+    if fresh:
+        check_fresh_snapshot(args, snapshot)
+    return snapshot
+
+
+def check_fresh_snapshot(args, snapshot):
+    """An advertised fresh-only owner must return the requested policy without history."""
+    check_resume_policy(args, snapshot)
+    if snapshot.get('messages') or snapshot.get('message_count', 0):
+        raise GatewayClientError('Fresh-only creation returned prior history; no query sent.')
 
 
 _RESUME_POLICY_MISMATCH = "Resume retains gateway session policy; creation overrides are unsupported on resume."

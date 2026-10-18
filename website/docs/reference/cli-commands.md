@@ -115,6 +115,22 @@ The install also ships `hermes-agent`, a minimal runner that sends one query and
 
 ## `hermes chat`
 
+For programmatic **create-only** work, use `hermes chat --cli -c <title>
+--create-if-missing --fresh-only -q <prompt>`. The owner must advertise
+`fresh_only` in `runtime.describe.session_create.parameters`; an older owner
+is refused before creation/query. Ordinary `--create-if-missing` remains
+resume-or-create. Fresh-only refuses an existing creation identity or any
+matching title/id/numbered continuation, including hidden, foreign, archived
+and empty rows, with a generic conflict and no old-session snapshot. It never
+reclaims or relabels a row. New title and user provenance commit atomically
+with the new route and policy, before query admission. It does not provide a
+filesystem, credential or process sandbox.
+
+An uncertain/lost creation reply is **not** permission to retry. Reconcile the
+original request identity read-only; do not send a query until freshness and
+policy are established. This option changes no ordinary resume/idempotency
+semantics and does not change profile models, tools or capacity defaults.
+
 ```bash
 hermes chat [options]
 ```
