@@ -237,6 +237,9 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     must stay a ``.env`` overlay, not a blindfold (otherwise cron 401s). With no
     scope: multiplex INACTIVE reads ``os.environ``; ACTIVE raises (fail closed).
     """
+    from agent.managed_authority import exclusion_enabled, parent_authority_name
+    if exclusion_enabled() and parent_authority_name(name):
+        return default
     if _is_global_env(name):
         return _environ_or(name, default)
     bound = _SECRET_SCOPE.get()

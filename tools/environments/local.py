@@ -308,7 +308,8 @@ def _finalize_child_env(env: dict) -> dict:
     strip_supervised_process_identity(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    from agent.managed_authority import exclude_parent_authority
+    return exclude_parent_authority(delegated_child_subprocess_env(env))
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -416,7 +417,8 @@ def build_subprocess_env(
         env.update(extra)
     strip_supervised_process_identity(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    from agent.managed_authority import exclude_parent_authority
+    return exclude_parent_authority(delegated_child_subprocess_env(env))
 
 
 def served_profile_child_env(
@@ -460,7 +462,8 @@ def served_profile_child_env(
                     "no profile secret scope bound while multiplexing is on; the child would inherit the "
                     "launch profile's credentials. Bind the profile scope (or pass target_home) at the spawn site.")
         env.update((k, v) for k, v in (secrets or {}).items() if v is not None)
-    return env
+    from agent.managed_authority import exclude_parent_authority
+    return exclude_parent_authority(env)
 
 
 def host_gateway_child_env(
