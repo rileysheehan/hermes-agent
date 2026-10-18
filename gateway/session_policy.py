@@ -17,7 +17,7 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
                            'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
-                           'evaluation_isolation', 'fresh_only'})
+                           'evaluation_isolation', 'fresh_only', 'exclude_parent_authority'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -599,10 +599,16 @@ def _apply_launch_overrides(params, config):
                     _refuse('base_url', 'must be an http(s) URL without credentials, query or fragment')
             config.setdefault('model', {})[key] = value
     bad_flag = next((flag for flag in ('ignore_rules', 'yolo', 'checkpoints', 'accept_hooks', 'pass_session_id',
-                                      'follow_profile_config', 'cwd_explicit', 'verbose', 'fresh_only')
+                                      'follow_profile_config', 'cwd_explicit', 'verbose', 'fresh_only',
+                                      'exclude_parent_authority')
                      if flag in params and type(params[flag]) is not bool), None)
     if bad_flag:
         _refuse(bad_flag, 'must be a boolean')
+    if params.get('exclude_parent_authority') and not (
+            params.get('source') == 'oneshot' and params.get('fresh_only') is True
+            and params.get('ignore_user_config') is True and params.get('ignore_rules') is True
+            and not any(params.get(k) for k in ('editor', 'follow_profile_config', 'accept_hooks', 'skills'))):
+        raise RuntimeStoreError('authority_exclusion_unproven')
     if 'service_tier' in params:
         # An explicit speed pick (Desktop Fast / Ultrafast / Normal): normal pins normal over a
         # profile tier; an unknown word is refused, never read as normal.

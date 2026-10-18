@@ -20,7 +20,7 @@ _UNSUPPORTED = (
     "run_budget", "verbose", "compact",
 )
 _POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "base_url", "ignore_rules", "api_key",
-           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id", "fresh_only")
+           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id", "fresh_only", "exclude_parent_authority")
 # Where each refused option lives now; the refusal names it so the user is not left guessing.
 _RELOCATED = {
     "image": "`hermes --tui` or the Desktop app to attach the image",
@@ -89,6 +89,9 @@ def wants_latest(args):
 
 
 def validate_options(args):
+    if getattr(args, 'exclude_parent_authority', False) and not all(
+            getattr(args, name, False) for name in ('fresh_only', 'ignore_user_config', 'ignore_rules')):
+        raise GatewayClientError('--exclude-parent-authority requires fresh-only config-only rule-free creation.')
     if getattr(args, 'fresh_only', False) and not (
             continue_title(args) and getattr(args, 'create_if_missing', False)):
         raise GatewayClientError('--fresh-only requires -c <name> --create-if-missing; it never resumes.')

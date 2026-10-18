@@ -22,7 +22,7 @@ for line in sys.stdin.buffer:
 """
 
 
-@pytest.mark.platforms("linux")
+@pytest.mark.platforms("linux", "macos")
 def test_valid_output_after_stop_does_not_renew_the_ack_budget():
     from gateway.session_managed_worker import ManagedWorker
     child = subprocess.Popen([sys.executable, '-c', CHATTY], stdin=subprocess.PIPE,

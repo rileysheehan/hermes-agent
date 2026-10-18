@@ -45,6 +45,7 @@ class CanonicalCreateParams(ProfileParams):
     title: str | None = None
     # Refuse reuse of a title/creation identity; title is committed with the new row.
     fresh_only: bool = False
+    exclude_parent_authority: bool = False
     hidden: bool = False
     follow_profile_config: bool | None = None
     service_tier: str | None = None
