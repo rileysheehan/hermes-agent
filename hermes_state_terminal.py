@@ -46,8 +46,29 @@ def compact_result(result, *, user_message=None):
             # Consumers must not infer a new boundary from them after the real anchor is gone.
             value['_messages_are_turn_suffix'] = True
             value.pop('current_turn_user_idx', None)
+        value['messages'] = _without_tool_result_images(value['messages'])
     result['result'] = value
     return result
+
+
+def _without_tool_result_images(messages):
+    """Tool-result screenshots leave the stored copy as text placeholders.
+
+    The transcript never stores a tool result's inline image (the row keeps its text, which names
+    the saved file), but the turn result still carried the base64 payload: one full-screen
+    ``computer_use`` capture is ~13 MB, so a turn with a few of them stored tens of MB per row.
+    User-attached images are untouched: a chained Responses turn may replay them."""
+    from agent.context_compressor import _strip_images_from_tool_msg
+    out = None
+    for i, msg in enumerate(messages):
+        if not (isinstance(msg, dict) and msg.get('role') == 'tool'):
+            continue
+        stripped = _strip_images_from_tool_msg(msg)
+        if stripped is not None:
+            if out is None:
+                out = list(messages)
+            out[i] = stripped
+    return messages if out is None else out
 
 
 # Top-level row key only ``encode_result`` writes. The row's top level is built by the gateway
