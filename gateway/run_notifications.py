@@ -67,16 +67,30 @@ _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", 
 # Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
 _MAX_COMPLETION_INJECTION_ATTEMPTS = 8
 _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
-# Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
-# 2 s drain cadence instead of the watcher's check interval (#140899).
+# Drain retries of a refused watch event follow the same bounded backoff (4 s doubling to 60 s), keyed
+# to the 2 s drain cadence instead of the watcher's check interval (#140899). Mercury never drops a
+# refused watch event, permanent-looking or not: a suspended route answers ``not_found`` and can
+# clear after upstream's 8-attempt budget (MER-1177 review), so a refusal that never clears costs
+# one attempt a minute per event instead.
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+
+
+def _watch_retry_clock() -> float:
+    """The drain's backoff clock (a test seam: asyncio itself also reads ``time.monotonic``)."""
+    return time.monotonic()
 
 
 def _refusal_retry_at(step: int) -> float:
     """When a refused queued notice is next offered: exponential from the drain base, capped."""
-    return time.monotonic() + jittered_backoff(
+    return _watch_retry_clock() + jittered_backoff(
         step, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
         max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
+
+
+def _watch_event_ref(evt: dict) -> str:
+    """The producer-stable id of one watch event (each pattern hit has its own ``event_id``)."""
+    return str(evt.get("event_id") or "-")
+
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -721,7 +735,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
-            if next_retry_at is not None and next_retry_at > time.monotonic():
+            if next_retry_at is not None and next_retry_at > _watch_retry_clock():
                 # Backoff between refused injections: hold the event for a later drain tick
                 # instead of re-attempting admission every 2 s (#140899).
                 completion_queue.put(evt)
@@ -747,32 +761,37 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
                 self._requeue_refused_watch_event(completion_queue, evt)
+            elif delivered:
+                logger.info(
+                    "Watch notification admitted for %s chat=%s event=%s proc=%s type=%s attempts=%d",
+                    evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
+                    evt.get("session_id") or "?", evt.get("type") or "?",
+                    int(evt.get("_watch_retry_step") or 0) + 1,
+                )
 
     @staticmethod
     def _requeue_refused_watch_event(completion_queue, evt: dict) -> None:
         """Retry a refused watch event on a bounded backoff, never on every 2 s tick (#140899).
 
-        Only a refusal proven permanent (``WakeNotAccepted.permanent``: the route has no session,
-        or the payload is invalid) counts toward the cap that drops it. A transient one (a restart's
-        after-turn wait, a parked profile, a full owner FIFO) or one whose owner may still appear (an
-        unowned or foreign-pinned notice) waits it out however long it lasts.
+        Mercury never drops it, whatever the refusal: ``False`` is the retryable contract, and a
+        refusal upstream counts as permanent (``not_found`` from a suspended route) can still clear
+        after its 8-attempt budget (MER-1177 review). A refusal that never clears costs one attempt
+        a minute per event. Each refusal logs one line naming the event, its attempt and the refusal
+        code, so an outcome check can bound attempts per event and tell delivery from refusal.
         """
         step = int(evt.get("_watch_retry_step") or 0) + 1
         evt["_watch_retry_step"] = step
-        if evt.pop("_refusal_permanent", False):
-            refusals = int(evt.get("_watch_injection_attempts") or 0) + 1
-            evt["_watch_injection_attempts"] = refusals
-            if refusals >= _MAX_COMPLETION_INJECTION_ATTEMPTS:
-                logger.warning(
-                    "Watch notification for %s chat=%s (type=%s session_id=%s) was refused "
-                    "%d times; dropping the queued event (output remains available via "
-                    "process(action='log'))",
-                    evt.get("platform") or "?", evt.get("chat_id") or "?",
-                    evt.get("type") or "?", evt.get("session_id", "unknown"), refusals,
-                )
-                return
-        evt["_watch_next_retry_at"] = _refusal_retry_at(step)
+        evt.pop("_refusal_permanent", None)
+        retry_at = _refusal_retry_at(step)
+        evt["_watch_next_retry_at"] = retry_at
         completion_queue.put(evt)
+        logger.warning(
+            "Watch notification refused for %s chat=%s event=%s proc=%s type=%s attempt=%d "
+            "code=%s; retrying in %ds",
+            evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
+            evt.get("session_id") or "?", evt.get("type") or "?", step,
+            evt.pop("_watch_last_refusal", None) or "unadmitted", round(retry_at - _watch_retry_clock()),
+        )
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
@@ -964,9 +983,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise
+            evt["_watch_last_refusal"] = str(exc) or "refused"
             return False
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+            if not raise_not_accepted:
+                evt["_watch_last_refusal"] = "injection_error"
             return False
 
     @staticmethod
