@@ -324,15 +324,15 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
-async def test_post_turn_watch_drain_refused_event_backs_off_then_drops(monkeypatch, tmp_path, caplog):
-    """Regression for #140899: a watch event whose injection is refused must be retried on a
-    bounded backoff and finally dropped with ONE warning — never requeued on every 2 s drain
-    tick forever (seen on Mercury as ~77 injections a minute into ended local board-run sessions)."""
+async def test_post_turn_watch_drain_refused_event_backs_off_and_is_kept(monkeypatch, tmp_path, caplog):
+    """Regression for #140899: a refused watch event is retried on a capped backoff instead of on
+    every drain tick (seen on Mercury as ~77 injections a minute), and it is never dropped: ``False``
+    is retryable, so the event stays queued until admission accepts it (MER-1177 review)."""
     import itertools
     import logging
 
     from gateway import run_notifications
-    from gateway.run_notifications import _MAX_WATCH_INJECTION_ATTEMPTS, _WATCH_INJECTION_RETRY_BASE_DELAY
+    from gateway.run_notifications import _WATCH_INJECTION_RETRY_BASE_DELAY, _WATCH_INJECTION_RETRY_MAX_DELAY
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     completion_queue = queue.Queue()
@@ -348,22 +348,20 @@ async def test_post_turn_watch_drain_refused_event_backs_off_then_drops(monkeypa
 
     monkeypatch.setattr(run_notifications.GatewayNotificationsMixin, "_inject_watch_notification", refused)
 
-    for _ in range(500):
-        await runner._drain_watch_notifications(completion_queue)
-        clock["now"] += 2.0
-        if completion_queue.empty():
-            break
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        for _ in range(1800):  # one hour of 2 s drain ticks
+            await runner._drain_watch_notifications(completion_queue)
+            clock["now"] += 2.0
 
-    assert len(attempt_times) == _MAX_WATCH_INJECTION_ATTEMPTS
+    assert completion_queue.qsize() == 1  # kept, not dropped
     gaps = [b - a for a, b in itertools.pairwise(attempt_times)]
-    assert gaps
     assert all(gap >= _WATCH_INJECTION_RETRY_BASE_DELAY for gap in gaps)
-    assert attempt_times[-1] - attempt_times[0] < 600  # gives up within minutes, not never
-    assert completion_queue.empty()
-    drops = [r for r in caplog.records
-             if r.levelno >= logging.WARNING and "dropping the queued event" in r.getMessage()]
-    assert len(drops) == 1
-    assert f"refused {_MAX_WATCH_INJECTION_ATTEMPTS} times" in drops[0].getMessage()
+    assert max(gaps) <= _WATCH_INJECTION_RETRY_MAX_DELAY + 2
+    assert 55 <= len(attempt_times) <= 66  # about one a minute, not 1,800
+    refused_lines = [r.getMessage() for r in caplog.records if "Watch notification refused" in r.getMessage()]
+    assert len(refused_lines) == len(attempt_times)
+    assert all("event=" in line and "code=unadmitted" in line for line in refused_lines)
+    assert not [r for r in caplog.records if "dropping" in r.getMessage()]
 
 
 @pytest.mark.asyncio

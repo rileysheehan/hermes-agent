@@ -63,10 +63,11 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
-# Drain retries of a refused watch event: 8 attempts with capped backoff (4 s base, 60 s cap,
-# about 4 min), then one WARNING and the event is dropped (#140899; upstream PR #140911 applies
-# the same policy with #139026's process-watcher constants, which this tree does not carry).
-_MAX_WATCH_INJECTION_ATTEMPTS = 8
+# Drain retries of a refused watch event (#140899): capped backoff, 4 s doubling to 60 s, and
+# no attempt cap. A refused event is never dropped (``False`` is retryable; the base tree retried
+# it every tick forever), so a refusal that never clears costs one attempt a minute per event.
+# Upstream PR #140911 instead drops after 8 attempts; Mercury does not, so nothing it would have
+# delivered is lost (MER-1177 review).
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
 _WATCH_INJECTION_RETRY_MAX_DELAY = 60
 
@@ -74,6 +75,12 @@ _WATCH_INJECTION_RETRY_MAX_DELAY = 60
 def _watch_retry_clock() -> float:
     """Clock for the watch-drain retry backoff (a module seam so tests never patch ``time``)."""
     return time.monotonic()
+
+
+def _watch_event_ref(evt: dict) -> str:
+    """The producer-stable id of one watch event (each pattern hit has its own ``event_id``)."""
+    return str(evt.get("event_id") or "-")
+
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -721,21 +728,29 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if delivered is False:
                 attempts = int(evt.get("_watch_injection_attempts") or 0) + 1
                 evt["_watch_injection_attempts"] = attempts
-                if attempts < _MAX_WATCH_INJECTION_ATTEMPTS:
-                    # A refusal may clear (adapter reconnecting, store draining): retry with
-                    # bounded backoff, never on every tick (#140899).
-                    from agent.retry_utils import jittered_backoff
-                    evt["_watch_next_retry_at"] = _watch_retry_clock() + jittered_backoff(
-                        attempts, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
-                        max_delay=_WATCH_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
-                    completion_queue.put(evt)
-                else:
-                    logger.warning(
-                        "Watch notification for %s chat=%s (type=%s session_id=%s) was refused "
-                        "%d times; dropping the queued event",
-                        evt.get("platform") or "?", evt.get("chat_id") or "?",
-                        evt.get("type") or "?", evt.get("session_id", "unknown"), attempts,
-                    )
+                # Never drop: a refusal may clear at any time (adapter reconnecting, store draining,
+                # a suspended route coming back), and ``False`` is the retryable contract. Back off
+                # instead, so a refusal that never clears costs one attempt a minute, not one a tick
+                # (#140899). The line names the event, so a check can bound attempts per event.
+                from agent.retry_utils import jittered_backoff
+                delay = jittered_backoff(attempts, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
+                                         max_delay=_WATCH_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
+                evt["_watch_next_retry_at"] = _watch_retry_clock() + delay
+                completion_queue.put(evt)
+                logger.warning(
+                    "Watch notification refused for %s chat=%s event=%s proc=%s type=%s attempt=%d "
+                    "code=%s; retrying in %ds",
+                    evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
+                    evt.get("session_id") or "?", evt.get("type") or "?", attempts,
+                    evt.pop("_watch_last_refusal", None) or "unadmitted", int(delay),
+                )
+            elif delivered:
+                logger.info(
+                    "Watch notification admitted for %s chat=%s event=%s proc=%s type=%s attempts=%d",
+                    evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
+                    evt.get("session_id") or "?", evt.get("type") or "?",
+                    int(evt.get("_watch_injection_attempts") or 0) + 1,
+                )
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
@@ -918,9 +933,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise
+            evt["_watch_last_refusal"] = str(exc) or "refused"
             return False
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+            if not raise_not_accepted:
+                evt["_watch_last_refusal"] = "injection_error"
             return False
 
     @staticmethod
