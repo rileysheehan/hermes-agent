@@ -144,7 +144,7 @@ def _route_gone(runner, entry):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('refusal', ['permanent', 'foreign', 'transient'])
-async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monkeypatch, caplog, refusal):
+async def test_refused_notice_backs_off_and_is_never_dropped(monkeypatch, caplog, refusal):
     """A refused watch notice is retried on a bounded backoff, never on every 2 s tick (#140899). A
     proven-permanent refusal (``not_found``: the route holds no session) drops it at the cap. A
     notice pinned to another chat's live session (``admission_conflict``) or refused by a restart's
@@ -171,14 +171,14 @@ async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monke
 
         messages = [r.getMessage() for r in caplog.records]
         refused = sum('not admitted' in m for m in messages)
-        if refusal == 'permanent':
-            assert pending.empty()
-            assert refused == _MAX_COMPLETION_INJECTION_ATTEMPTS
-            assert sum('dropping the queued event' in m for m in messages) == 1
-            return
-        assert not pending.empty(), 'a notice whose refusal may still clear is never dropped'
+        # Mercury (MER-1177 review): even a ``not_found`` refusal is kept, since a suspended route can
+        # come back after the 8-attempt budget; it costs one attempt a minute, never one per tick.
+        assert not pending.empty(), 'a refused notice is never dropped'
         assert 20 < refused < 60, 'retries are spaced out (capped at 60 s), not attempted every tick'
         assert not [m for m in messages if 'dropping the queued event' in m]
+        if refusal == 'permanent':
+            assert refused > _MAX_COMPLETION_INJECTION_ATTEMPTS
+            return
         if refusal == 'transient':
             runner._draining = False
             clock.now += 120
