@@ -63,6 +63,17 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
+# Drain retries of a refused watch event: 8 attempts with capped backoff (4 s base, 60 s cap,
+# about 4 min), then one WARNING and the event is dropped (#140899; upstream PR #140911 applies
+# the same policy with #139026's process-watcher constants, which this tree does not carry).
+_MAX_WATCH_INJECTION_ATTEMPTS = 8
+_WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+_WATCH_INJECTION_RETRY_MAX_DELAY = 60
+
+
+def _watch_retry_clock() -> float:
+    """Clock for the watch-drain retry backoff (a module seam so tests never patch ``time``)."""
+    return time.monotonic()
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -687,6 +698,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
+            next_retry_at = evt.get("_watch_next_retry_at")
+            if next_retry_at is not None and next_retry_at > _watch_retry_clock():
+                # Backoff between refused injections: hold the event for a later drain tick
+                # instead of re-attempting admission every 2 s (#140899).
+                completion_queue.put(evt)
+                continue
             async with self._completion_event_scope(evt):
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt):
@@ -702,7 +719,23 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     logger.exception("Watch notification injection error")
                     delivered = False
             if delivered is False:
-                completion_queue.put(evt)
+                attempts = int(evt.get("_watch_injection_attempts") or 0) + 1
+                evt["_watch_injection_attempts"] = attempts
+                if attempts < _MAX_WATCH_INJECTION_ATTEMPTS:
+                    # A refusal may clear (adapter reconnecting, store draining): retry with
+                    # bounded backoff, never on every tick (#140899).
+                    from agent.retry_utils import jittered_backoff
+                    evt["_watch_next_retry_at"] = _watch_retry_clock() + jittered_backoff(
+                        attempts, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
+                        max_delay=_WATCH_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
+                    completion_queue.put(evt)
+                else:
+                    logger.warning(
+                        "Watch notification for %s chat=%s (type=%s session_id=%s) was refused "
+                        "%d times; dropping the queued event",
+                        evt.get("platform") or "?", evt.get("chat_id") or "?",
+                        evt.get("type") or "?", evt.get("session_id", "unknown"), attempts,
+                    )
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
