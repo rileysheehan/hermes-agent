@@ -324,6 +324,115 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_post_turn_watch_drain_refused_event_backs_off_and_is_kept(monkeypatch, tmp_path, caplog):
+    """Regression for #140899: a refused watch event is retried on a capped backoff instead of on
+    every drain tick (seen on Mercury as ~77 injections a minute), and it is never dropped: ``False``
+    is retryable, so the event stays queued until admission accepts it (MER-1177 review)."""
+    import itertools
+    import logging
+
+    from gateway import run_notifications
+    from gateway.run_notifications import _WATCH_INJECTION_RETRY_BASE_DELAY, _WATCH_INJECTION_RETRY_MAX_DELAY
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    completion_queue = queue.Queue()
+    completion_queue.put(_watch_event())
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(run_notifications, "_watch_retry_clock", lambda: clock["now"])
+    attempt_times: list[float] = []
+
+    async def refused(self, synth_text, evt, **kwargs):
+        attempt_times.append(clock["now"])
+        return False
+
+    monkeypatch.setattr(run_notifications.GatewayNotificationsMixin, "_inject_watch_notification", refused)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        for _ in range(1800):  # one hour of 2 s drain ticks
+            await runner._drain_watch_notifications(completion_queue)
+            clock["now"] += 2.0
+
+    assert completion_queue.qsize() == 1  # kept, not dropped
+    gaps = [b - a for a, b in itertools.pairwise(attempt_times)]
+    assert all(gap >= _WATCH_INJECTION_RETRY_BASE_DELAY for gap in gaps)
+    assert max(gaps) <= _WATCH_INJECTION_RETRY_MAX_DELAY + 2
+    assert 55 <= len(attempt_times) <= 66  # about one a minute, not 1,800
+    refused_lines = [r.getMessage() for r in caplog.records if "Watch notification refused" in r.getMessage()]
+    assert len(refused_lines) == len(attempt_times)
+    assert all("event=" in line and "code=unadmitted" in line for line in refused_lines)
+    assert not [r for r in caplog.records if "dropping" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_post_turn_watch_drain_transient_refusal_recovers_without_drop(monkeypatch, tmp_path, caplog):
+    """A refusal that clears within the backoff budget delivers on the retry — the cap only
+    drops events that stay refused (#140899)."""
+    import logging
+
+    from gateway import run_notifications
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    completion_queue = queue.Queue()
+    completion_queue.put(_watch_event())
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(run_notifications, "_watch_retry_clock", lambda: clock["now"])
+    flaky = {"refusals_left": 2, "delivered": 0}
+
+    async def flaky_inject(self, synth_text, evt, **kwargs):
+        if flaky["refusals_left"]:
+            flaky["refusals_left"] -= 1
+            return False
+        flaky["delivered"] += 1
+        return True
+
+    monkeypatch.setattr(run_notifications.GatewayNotificationsMixin, "_inject_watch_notification", flaky_inject)
+
+    for _ in range(500):
+        await runner._drain_watch_notifications(completion_queue)
+        clock["now"] += 2.0
+        if completion_queue.empty():
+            break
+
+    assert completion_queue.empty()
+    assert flaky["delivered"] == 1
+    assert not [r for r in caplog.records
+                if r.levelno >= logging.WARNING and "dropping the queued event" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_refused_watch_wake_logs_the_refusal_code(monkeypatch, tmp_path, caplog):
+    """The refusal code reaches the log (#139069): a silent requeue is what hid the loop."""
+    import logging
+
+    from gateway.session import SessionSource
+    from gateway.wake import WakeNotAccepted
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.session_store._entries["agent:main:telegram:dm:123:42"] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="42",
+                             user_id="proc_owner", user_name="alice"))
+
+    class _Authority:
+        async def admit_automation(self, adapter, event, identity):
+            raise RuntimeStoreError("permission_denied")
+
+    import gateway.session_authorities as authorities
+    monkeypatch.setattr(authorities, "active_authority", lambda runner: _Authority())
+    import gateway.session_automation as automation
+    monkeypatch.setattr(automation, "producer_identity", lambda runner, evt: "probe")
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        assert await runner._inject_watch_notification("[match]", _watch_event()) is False
+        with pytest.raises(WakeNotAccepted):
+            await runner._inject_watch_notification("[match]", _watch_event(), raise_not_accepted=True)
+    refusals = [r.getMessage() for r in caplog.records if "not admitted" in r.getMessage()]
+    assert refusals == ["Watch notification not admitted for telegram chat=123: permission_denied"] * 2
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkeypatch, tmp_path):
     """Regression for #52694: the synthetic watch event must not reuse the triggering
     message id as its reply anchor.

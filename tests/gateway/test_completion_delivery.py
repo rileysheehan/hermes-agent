@@ -980,11 +980,19 @@ def test_idle_watch_drain_respects_notify_mode(monkeypatch, isolated_registry, e
 
 
 def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
+    import itertools
+
+    from gateway import run_notifications
+
     adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=[RuntimeError("offline"), None]))
     runner = _runner(adapter)
     runner._load_background_notifications_mode = lambda: "concise"
     evt = dict(_completion_event(started_at=1), type="watch_match", pattern="READY", output="READY")
     isolated_registry.completion_queue.put(evt)
+    # A refused watch event is retried after a bounded backoff (#140899), not on the next tick:
+    # each clock read moves past the longest delay, so the second drain tick retries it.
+    clock = itertools.count(0, 120)
+    monkeypatch.setattr(run_notifications, "_watch_retry_clock", lambda: float(next(clock)))
     _stop_after_sleeps(monkeypatch, runner, count=3)
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
