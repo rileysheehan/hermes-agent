@@ -1008,6 +1008,22 @@ def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRAT
     return prune_idle_entries(root, max_idle_hours, frozenset({_SCRATCH_PRUNE_STAMP}), log_file)
 
 
+def sweep_scratch_dir(scratch: Path | None = None) -> int:
+    """Prune *scratch* (default: the active home's) now, for a long-lived caller on its own timer.
+
+    The boot path (:func:`get_scratch_dir`) prunes at most once per process, which is the first home
+    a process resolves: a multiplexed gateway serves every profile from one long-lived process, so
+    its other homes were never pruned and even that one never again after boot. The gateway's
+    hourly housekeeping calls this for each served home instead. It stamps ``.last_prune`` first,
+    exactly as the boot path does, so other processes' hourly gate counts this sweep. Returns the
+    number of entries removed.
+    """
+    root = scratch if scratch is not None else get_scratch_dir(prune=False)
+    with contextlib.suppress(OSError):
+        (root / _SCRATCH_PRUNE_STAMP).touch()
+    return prune_scratch_dir(root)
+
+
 def _prune_scratch_dir_once(scratch: Path) -> None:
     global _scratch_pruned_once
     if _scratch_pruned_once:

@@ -4470,6 +4470,21 @@ def _housekeeping_checkpoint_prune() -> None:
     auto_prune_from_config()
 
 
+def _housekeeping_scratch_prune() -> None:
+    """Idle-scratch retention for the profile in scope (run per served profile by its caller).
+
+    ``get_scratch_dir``'s boot prune is spent once per process, on whichever home resolves first,
+    so on a multiplexed gateway every other served home's ``cache/scratch`` kept its idle entries
+    for the gateway's whole life. ``get_scratch_dir(prune=False)`` resolves through the active
+    profile scope, so each served home is swept here, under the same 24h idle rule.
+    """
+    from hermes_constants import get_scratch_dir, sweep_scratch_dir
+    scratch = get_scratch_dir(prune=False)
+    removed = sweep_scratch_dir(scratch)
+    if removed:
+        logger.info("Scratch prune: removed %d idle entr%s from %s", removed, "y" if removed == 1 else "ies", scratch)
+
+
 def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
     """Drain each profile's worker queue through its matching live adapters. A credential-less satellite
     profile (empty adapter map) drains through the primary's adapters routed by its own profile routes."""
@@ -4543,6 +4558,9 @@ def _start_gateway_housekeeping(
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
+        # Per served profile, hourly: every home's idle scratch, not only the first one this process
+        # resolved. Near the end with the checkpoint prune: a sweep that deletes can hold the thread.
+        (60, "Scratch prune tick", profile_scoped_chore(runner, _housekeeping_scratch_prune)),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
         (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune)]
 
