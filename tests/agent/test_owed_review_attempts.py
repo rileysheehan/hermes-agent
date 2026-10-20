@@ -273,3 +273,109 @@ def test_back_to_back_wakes_keep_the_debt_below_the_cap_until_a_review_finishes(
     fork.finish.set()                                            # this one runs to the end
     _done(agent)
     assert _marker("board-session") is None                      # settled
+
+
+# ── a slow fork: the live turn stops waiting before the superseded review exits ──
+
+
+class _SlowFork(_Fork):
+    """Acknowledges an interrupt only when the test lets it return (past the canceller's bounded wait)."""
+
+    def __init__(self):
+        super().__init__()
+        self.may_return = threading.Event()
+
+    def run_conversation(self, **kw):
+        self.started.set()
+        assert self.interrupted.wait(5)
+        assert self.may_return.wait(10)
+        return {"interrupted": True}
+
+
+@pytest.fixture
+def slow_forks(monkeypatch, forks):
+    built = []
+
+    def _build(*a, **k):
+        built.append(_SlowFork())
+        return built[-1], {}, False
+    monkeypatch.setattr(br, "build_cache_parity_fork", _build)
+    return built
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["acknowledged-in-time", "next-turn-finalizes-first"])
+def test_a_supersede_past_the_cancel_wait_still_returns_its_attempt(home, monkeypatch, slow_forks, overlap):
+    """Marin's MER-1215 review probe, with the real 2 s bound: the live turn stops waiting, its finalize_turn
+    replaces the owed token and its own review is not admitted (the old fork is still running), and only then
+    does the superseded fork return. Its attempt must already be back: refunding at the fork's exit would use
+    the obsolete token, which the marker rightly refuses, and three repeats capped the debt."""
+    assert br._BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS == 2
+    _cfg(monkeypatch, carry_owed_reviews=True)
+    agent = _agent(monkeypatch)
+    observed = []
+    for index in range(3):
+        token = _mark("board-session")
+        run, worker = _start_review(agent, "board-session", token)
+        fork = _wait_started(slow_forks, index + 1)
+        if not overlap:
+            fork.may_return.set()
+        br.cancel_background_review_for_live_turn(agent, superseded=True)
+        assert fork.interrupted.wait(5)
+        if overlap:
+            assert not run.request_done.is_set()                 # the cancel wait ran out
+            assert _turn(agent)["token"] != token                # the next turn's mark: a new token
+            assert agent._background_review_run is run           # ... and its own review was not admitted
+        fork.may_return.set()
+        worker.join(5)
+        assert not worker.is_alive() and run.request_done.is_set()
+        observed.append(owed_review.read("board-session")["attempts"])
+    assert observed == [0, 0, 0]
+    assert owed_review.owed_kinds("board-session") == (True, False)
+    assert owed_review.read("board-session")["pid"] == os.getpid()
+
+
+def test_a_supersede_past_the_cancel_wait_returns_the_attempt_once(home, monkeypatch, slow_forks):
+    """The canceller returns the attempt when its wait runs out, and the fork's exit must not return it again
+    when the token is still the same (no turn finalized in between)."""
+    monkeypatch.setattr(br, "_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS", 0.05)
+    agent = _parent()
+    _mark()
+    token = _mark()                                              # attempts 2: a real earlier failure counted
+    run, worker = _start_review(agent, "s", token)
+    fork = _wait_started(slow_forks, 1)
+    br.cancel_background_review_for_live_turn(agent, superseded=True)
+    assert not run.request_done.is_set() and owed_review.read("s")["attempts"] == 1
+    fork.may_return.set()
+    worker.join(5)
+    data = owed_review.read("s")
+    assert data["attempts"] == 1 and data["token"] == token and data["pid"] == os.getpid()
+
+
+def test_a_teardown_cancel_past_the_wait_still_spends_its_attempt(home, monkeypatch, slow_forks):
+    monkeypatch.setattr(br, "_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS", 0.05)
+    agent = _parent()
+    token = _mark()
+    run, worker = _start_review(agent, "s", token)
+    fork = _wait_started(slow_forks, 1)
+    br.cancel_background_review_for_live_turn(agent)             # session teardown / explicit stop
+    fork.may_return.set()
+    worker.join(5)
+    assert run.request_done.is_set() and owed_review.read("s")["attempts"] == 1
+
+
+def test_a_drain_claim_is_held_past_the_wait_and_handed_back_when_its_fork_exits(home, monkeypatch, slow_forks):
+    """Another session's claim is not released while its superseded fork may still be reviewing it: that would
+    let a second review of the same session start beside it. It goes back when the fork exits."""
+    monkeypatch.setattr(br, "_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS", 0.05)
+    owed_review.release("other", _mark("other"))
+    claim = owed_review.claim_orphan(exclude="s")
+    agent = _parent("s")
+    run, worker = _start_review(agent, "other", claim["token"])
+    fork = _wait_started(slow_forks, 1)
+    br.cancel_background_review_for_live_turn(agent, superseded=True)
+    held = owed_review.read("other")
+    assert held["attempts"] == 1 and held["pid"] == os.getpid() and owed_review.claim_orphan(exclude="s") is None
+    fork.may_return.set()
+    worker.join(5)
+    data = owed_review.read("other")
+    assert run.request_done.is_set() and data["attempts"] == 0 and data["pid"] == 0
