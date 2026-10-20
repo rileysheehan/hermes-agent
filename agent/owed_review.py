@@ -148,6 +148,42 @@ def _is_owed(data: Optional[dict[str, Any]]) -> bool:
     return bool(data) and bool(data.get("memory") or data.get("skills"))
 
 
+# Tokens whose attempt is counted and not yet given back (``refund`` / ``release``). Kept in the marker, under
+# the same lock as every count change, so a give-back is exactly once per token no matter which thread or
+# process makes it, and stays valid after a later mark replaces the current token. Bounded: a token trimmed off
+# the front can no longer be given back, so its attempt simply stays counted.
+_COUNTED_KEY = "counted_tokens"
+_MAX_COUNTED = 16
+
+
+def _counted(data: dict[str, Any]) -> Optional[list]:
+    """The marker's counted-token ledger, or ``None`` for a marker written before it existed."""
+    value = data.get(_COUNTED_KEY)
+    if not isinstance(value, list):
+        return None
+    return [t for t in value if isinstance(t, str) and t]
+
+
+def _count(data: dict[str, Any], token: str) -> None:
+    data[_COUNTED_KEY] = ((_counted(data) or []) + [token])[-_MAX_COUNTED:]
+
+
+def _take_counted(data: dict[str, Any], token: str) -> bool:
+    """Remove *token* from the ledger if its attempt is still counted. A marker with no ledger (written by an
+    older version) accepts only its current token, once: the empty ledger left behind refuses a repeat."""
+    counted = _counted(data)
+    if counted is None:
+        if data.get("token") != token:
+            return False
+        data[_COUNTED_KEY] = []
+        return True
+    if token not in counted:
+        return False
+    counted.remove(token)
+    data[_COUNTED_KEY] = counted
+    return True
+
+
 def read(session_id: str) -> Optional[dict[str, Any]]:
     if not session_id:
         return None
@@ -188,6 +224,8 @@ def mark_owed(session_id: str, *, memory: bool, skills: bool, reason: str, spawn
                 token=token,
                 carried_tool_calls=0,
             )
+            if spawning:
+                _count(data, token)
             _write(path, data)
         logger.info("Review owed: session=%s memory=%s skills=%s reason=%s attempts=%d",
                     session_id, data["memory"], data["skills"], reason, data["attempts"])
@@ -209,7 +247,7 @@ def settle(session_id: Optional[str], token: Optional[str]) -> bool:
                 return False
             if int(data.get("carried_tool_calls", 0) or 0) > 0:
                 # A short turn landed after this review started: keep its count, drop the debt.
-                for key in ("memory", "skills", "reason", "owed_since", "token"):
+                for key in ("memory", "skills", "reason", "owed_since", "token", _COUNTED_KEY):
                     data.pop(key, None)
                 data["attempts"] = 0
                 _write(path, data)
@@ -219,6 +257,36 @@ def settle(session_id: Optional[str], token: Optional[str]) -> bool:
         return True
     except Exception:
         logger.debug("Could not settle owed review for %s", session_id, exc_info=True)
+        return False
+
+
+def refund(session_id: Optional[str], token: Optional[str], *, reason: str) -> bool:
+    """The review carrying *token* spent no attempt after all: the session's own next live turn superseded it
+    (that turn's review covers the whole conversation) or it was never admitted (another review was in flight).
+    Give the attempt :func:`mark_owed` counted back and KEEP the writer's pid (unlike :func:`release`), so no
+    other process takes the debt over in the gap: the session's next review pays it.
+
+    Exactly once per token, decided under the marker lock by the counted-token ledger, so it holds across
+    threads (the superseded fork's exit and the live-turn canceller may both try) and still works after a newer
+    mark replaced the current token: that newer mark counted its own attempt, and this one is still in the
+    total. A token the marker never counted (another marker generation, a settled debt) or already gave back is
+    refused. A review cut off by the exit-linger budget, or one that failed, is never refunded and still counts.
+    :func:`settle` keeps its current-token fence: only the newest review clears the debt."""
+    if not session_id or not token:
+        return False
+    try:
+        with _lock():
+            path = _path(session_id)
+            data = _read(path)
+            if not data or not _take_counted(data, token):
+                return False
+            data["attempts"] = max(0, int(data.get("attempts", 0) or 0) - 1)
+            _write(path, data, pid=data.get("pid"))
+        logger.info("Owed review attempt returned: session=%s reason=%s attempts=%d",
+                    session_id, reason, data["attempts"])
+        return True
+    except Exception:
+        logger.debug("Could not return the owed-review attempt for %s", session_id, exc_info=True)
         return False
 
 
@@ -302,6 +370,7 @@ def claim_orphan(exclude: Optional[str] = None, *, now: Optional[float] = None) 
             _since, path, data = min(candidates, key=lambda c: c[0])
             data["token"] = uuid.uuid4().hex
             data["attempts"] = int(data.get("attempts", 0) or 0) + 1
+            _count(data, data["token"])
             data["reason"] = "carried_to_next_run"
             _write(path, data)
         logger.info("Claimed owed review: session=%s memory=%s skills=%s attempts=%d",
@@ -313,14 +382,15 @@ def claim_orphan(exclude: Optional[str] = None, *, now: Optional[float] = None) 
 
 
 def release(session_id: Optional[str], token: Optional[str]) -> None:
-    """A claimed review was not started after all: give the claim back (pid 0 = any process may take it)."""
+    """A claimed review was not started after all: give the claim back (pid 0 = any process may take it).
+    Only the current claim, and only once (the counted-token ledger, shared with :func:`refund`)."""
     if not session_id or not token:
         return
     with suppress(Exception):
         with _lock():
             path = _path(session_id)
             data = _read(path)
-            if data and data.get("token") == token:
+            if data and data.get("token") == token and _take_counted(data, token):
                 data["attempts"] = max(0, int(data.get("attempts", 0) or 0) - 1)
                 _write(path, data, pid=0)
 
