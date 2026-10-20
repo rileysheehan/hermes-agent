@@ -222,6 +222,30 @@ def settle(session_id: Optional[str], token: Optional[str]) -> bool:
         return False
 
 
+def refund(session_id: Optional[str], token: Optional[str], *, reason: str) -> bool:
+    """The review carrying *token* spent no attempt after all: the session's own next live turn superseded it
+    (that turn's review covers the whole conversation) or it was never admitted (another review was in flight).
+    Give the attempt :func:`mark_owed` counted back and KEEP the writer's pid (unlike :func:`release`), so no
+    other process takes the debt over in the gap: the session's next review pays it. Only the current token is
+    refunded; a review cut off by the exit-linger budget, or one that failed, still counts."""
+    if not session_id or not token:
+        return False
+    try:
+        with _lock():
+            path = _path(session_id)
+            data = _read(path)
+            if not data or data.get("token") != token:
+                return False
+            data["attempts"] = max(0, int(data.get("attempts", 0) or 0) - 1)
+            _write(path, data, pid=data.get("pid"))
+        logger.info("Owed review attempt returned: session=%s reason=%s attempts=%d",
+                    session_id, reason, data["attempts"])
+        return True
+    except Exception:
+        logger.debug("Could not return the owed-review attempt for %s", session_id, exc_info=True)
+        return False
+
+
 def touch(session_id: str) -> None:
     """A live process resumed *session_id*: stamp its pid so no other process takes its debt over;
     this session's own next review will pay it."""
