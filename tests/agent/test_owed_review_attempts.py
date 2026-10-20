@@ -94,19 +94,77 @@ def _done(agent):
 # ── the marker ────────────────────────────────────────────────────────────────
 
 
-def test_refund_returns_the_attempt_keeps_the_owner_and_needs_the_current_token(home):
+def test_refund_returns_each_counted_attempt_once_and_keeps_the_owner(home):
     old = _mark()
     new = _mark()
     assert owed_review.read("s")["attempts"] == 2
-    assert owed_review.refund("s", old, reason="superseded_by_live_turn") is False   # a newer mark is untouched
     assert owed_review.refund("s", new, reason="superseded_by_live_turn") is True
     data = owed_review.read("s")
     assert data["attempts"] == 1 and data["pid"] == os.getpid() and data["token"] == new
     assert owed_review.owed_kinds("s") == (True, False)        # still owed, for this session's next review
     assert owed_review.claim_orphan() is None                  # its owner is alive: nobody else takes it
-    owed_review.refund("s", new, reason="not_admitted")
-    owed_review.refund("s", new, reason="not_admitted")
-    assert owed_review.read("s")["attempts"] == 0              # never below zero
+    assert owed_review.refund("s", new, reason="not_admitted") is False      # once per token
+    # An older counted attempt can still come back after a newer mark replaced its token (MER-1215 r2/r3):
+    # the newer mark counted its own attempt, and this one is still in the total.
+    assert owed_review.refund("s", old, reason="superseded_by_live_turn") is True
+    assert owed_review.read("s")["attempts"] == 0 and owed_review.read("s")["token"] == new
+    assert owed_review.refund("s", old, reason="superseded_by_live_turn") is False
+    assert owed_review.refund("s", "never-counted", reason="not_admitted") is False
+    assert owed_review.settle("s", old) is False               # settle keeps its current-token fence
+    assert owed_review.settle("s", new) is True and _marker("s") is None
+
+
+def test_refund_refuses_a_token_from_a_settled_debt_or_an_uncounted_mark(home):
+    old = _mark()
+    assert owed_review.settle("s", old) is True
+    _mark()                                                    # a new debt: a new ledger
+    assert owed_review.refund("s", old, reason="superseded_by_live_turn") is False
+    quiet = owed_review.mark_owed("s", memory=True, skills=False, reason="interrupted", spawning=False)
+    assert owed_review.refund("s", quiet, reason="not_admitted") is False     # it never counted an attempt
+    assert owed_review.read("s")["attempts"] == 1
+
+
+def test_a_marker_from_before_the_ledger_refunds_only_its_current_token_once(home):
+    token = _mark()
+    old = _mark()
+    path = owed_review._path("s")
+    data = json.loads(path.read_text())
+    data.pop("counted_tokens")                                 # written by the previous Hermes
+    path.write_text(json.dumps(data))
+    assert owed_review.refund("s", token, reason="superseded_by_live_turn") is False
+    assert owed_review.refund("s", old, reason="superseded_by_live_turn") is True
+    assert owed_review.refund("s", old, reason="superseded_by_live_turn") is False
+    assert owed_review.read("s")["attempts"] == 1
+
+
+def test_release_is_current_token_only_and_shares_the_once_per_token_ledger(home):
+    first = _mark("other")
+    owed_review.release("other", first)
+    claim = owed_review.claim_orphan(exclude="s")
+    assert claim["attempts"] == 1
+    owed_review.release("other", first)                        # not the current claim: untouched
+    assert owed_review.read("other")["attempts"] == 1
+    owed_review.release("other", claim["token"])
+    owed_review.release("other", claim["token"])
+    data = owed_review.read("other")
+    assert data["attempts"] == 0 and data["pid"] == 0
+    assert owed_review.refund("other", claim["token"], reason="not_admitted") is False
+
+
+def test_concurrent_refunds_of_one_token_return_it_once(home):
+    _mark()
+    token = _mark()
+    start, results = threading.Barrier(8), []
+
+    def _go():
+        start.wait()
+        results.append(owed_review.refund("s", token, reason="superseded_by_live_turn"))
+    threads = [threading.Thread(target=_go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert results.count(True) == 1 and owed_review.read("s")["attempts"] == 1
 
 
 # ── a review superseded by the session's next live turn ──────────────────────
@@ -361,6 +419,50 @@ def test_a_teardown_cancel_past_the_wait_still_spends_its_attempt(home, monkeypa
     fork.may_return.set()
     worker.join(5)
     assert run.request_done.is_set() and owed_review.read("s")["attempts"] == 1
+
+
+@pytest.mark.parametrize("pause", [False, True], ids=["worker-refund-completes", "worker-paused-inside-refund"])
+def test_a_worker_paused_inside_its_refund_cannot_strand_the_attempt(home, monkeypatch, forks, pause):
+    """Marin's MER-1215 revision-2 probe, real 2 s bound: the superseded fork's exit enters its refund and stalls
+    before the marker write; the canceller's wait runs out; the next turn marks a new token and its own review
+    is not admitted; only then does the stalled refund run. Revision 2 let an in-memory latch tell the canceller
+    the attempt was already back, and the stalled write then met a newer token. Now the canceller does its own
+    refund, the ledger accepts exactly one of the two, and the stalled one is refused as already returned."""
+    assert br._BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS == 2
+    _cfg(monkeypatch, carry_owed_reviews=True)
+    agent = _agent(monkeypatch)
+    real_refund, main = owed_review.refund, threading.current_thread()
+    gates, returned = {}, []
+
+    def gated_refund(session, token, *, reason):
+        if pause and reason == "superseded_by_live_turn" and threading.current_thread() is not main:
+            gates["entered"].set()
+            assert gates["resume"].wait(8)
+        result = real_refund(session, token, reason=reason)
+        returned.append((reason, threading.current_thread() is main, result))
+        return result
+    monkeypatch.setattr(owed_review, "refund", gated_refund)
+    observed = []
+    for index in range(3):
+        gates.update(entered=threading.Event(), resume=threading.Event())
+        token = _mark("board-session")
+        run, worker = _start_review(agent, "board-session", token)
+        _wait_started(forks, index + 1)
+        br.cancel_background_review_for_live_turn(agent, superseded=True)
+        if pause:
+            assert gates["entered"].is_set() and not run.request_done.is_set()
+            assert owed_review.read("board-session")["attempts"] == 0   # the canceller's own refund landed
+            assert _turn(agent)["token"] != token and agent._background_review_run is run
+        gates["resume"].set()
+        worker.join(5)
+        assert not worker.is_alive() and run.request_done.is_set()
+        observed.append(owed_review.read("board-session")["attempts"])
+    assert observed == [0, 0, 0]
+    assert owed_review.owed_kinds("board-session") == (True, False)
+    superseded = [r for r in returned if r[0] == "superseded_by_live_turn"]
+    assert sum(1 for r in superseded if r[2]) == 3                # one return per superseded review, never two
+    if pause:
+        assert all(r[2] for r in superseded if r[1]) and not any(r[2] for r in superseded if not r[1])
 
 
 def test_a_drain_claim_is_held_past_the_wait_and_handed_back_when_its_fork_exits(home, monkeypatch, slow_forks):
