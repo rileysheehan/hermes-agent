@@ -38,7 +38,7 @@ class TurnFacadeMixin:
         # (#84423).
         from agent.background_review import cancel_background_review_for_live_turn
 
-        cancel_background_review_for_live_turn(self)
+        cancel_background_review_for_live_turn(self, superseded=True)
 
         from agent import relay_runtime
         from agent.aux_accounting import reset_accounting_context, set_accounting_context

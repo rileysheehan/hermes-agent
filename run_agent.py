@@ -817,6 +817,13 @@ class AIAgent(
 
         review_run = prepare_background_review_run(self)
         if review_run is None:
+            # carry_owed_reviews: this session's own review was not admitted (another review is still in
+            # flight), so the attempt mark_owed counted is given back; the debt stays for its next review.
+            # Another session's claimed debt (owed_session differs) is handed back by its own caller.
+            if owed_token and owed_session == getattr(self, "session_id", None):
+                from agent import owed_review
+
+                owed_review.refund(owed_session, owed_token, reason="not_admitted")
             return
         # Settled by _run_review_in_thread only when the fork returns un-interrupted.
         review_run.owed_session, review_run.owed_token = owed_session, owed_token

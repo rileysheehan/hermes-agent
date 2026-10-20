@@ -38,6 +38,8 @@ class _BackgroundReviewRun:
         # carry_owed_reviews: the owed-review marker this run settles when its fork finishes.
         self.owed_session: Optional[str] = None
         self.owed_token: Optional[str] = None
+        # Cancelled by a new live turn of the same agent (not a teardown): an owed attempt is returned.
+        self.superseded = False
 
     def begin_request(self, review_agent: Any) -> bool:
         """Atomically admit the first provider-capable review phase."""
@@ -47,9 +49,10 @@ class _BackgroundReviewRun:
             self._review_agent = review_agent
             return True
 
-    def cancel(self) -> Any:
+    def cancel(self, *, superseded: bool = False) -> Any:
         """Fence startup and return the running fork, if one was admitted."""
         with self._lock:
+            self.superseded = self.superseded or superseded
             self.cancel_requested.set()
             if self._review_agent is None or self._cancel_dispatched:
                 return None
@@ -135,6 +138,7 @@ def cancel_background_review_for_live_turn(
     *,
     message: str = "superseded by a new live turn",
     tool_reason: str = "background review superseded",
+    superseded: bool = False,
 ) -> None:
     """Cancel the current review and await its request-phase acknowledgement. Foreground priority:
     past the bounded deadline, warn and let the live turn proceed — self-improvement work must
@@ -151,11 +155,14 @@ def cancel_background_review_for_live_turn(
     the run-thread wait), so this is the only thing that ever sets its ``_interrupt_requested``. Pass
     a reason-appropriate ``message``/``tool_reason`` when the caller isn't the live-turn-preemption
     path so diagnostics describe the real cause.
+
+    ``superseded`` (``carry_owed_reviews``): the caller is the agent's next live turn, not a teardown, so
+    an owed review this cancels gives its attempt back (:func:`_return_superseded_owed_attempt`).
     """
     with _optional_lock(agent, "_background_review_lock"):
         run = getattr(agent, "_background_review_run", None)
         legacy_agent = getattr(agent, "_background_review_agent", None)
-    review_agent = legacy_agent if run is None else run.cancel()
+    review_agent = legacy_agent if run is None else run.cancel(superseded=superseded)
     # Attribute the review fork's usage to the PARENT session. Snapshot BEFORE unregister/close so counters
     # survive teardown. Placed in this finally so a fork that consumed tokens and THEN raised is still
     # attributed (issue #87250). Best-effort: the recorder never raises into the review thread.
@@ -1434,6 +1441,8 @@ def _run_review_fork(
                 # Before request_done is published (finally below): the exit linger stops waiting
                 # on that event, and the process may end right after it.
                 _settle_owed_review(review_run)
+        if not st.finished:
+            _return_superseded_owed_attempt(agent, review_run)
     finally:
         clear_thread_tool_whitelist()
         # Attribute usage to the PARENT session. Snapshot BEFORE unregister/close so counters
@@ -1459,6 +1468,29 @@ def _settle_owed_review(review_run: Optional[_BackgroundReviewRun]) -> None:
             from agent import owed_review
 
             owed_review.settle(session, token)
+
+
+def _return_superseded_owed_attempt(agent: Any, review_run: Optional[_BackgroundReviewRun]) -> None:
+    """``carry_owed_reviews``: a review the agent's next live turn cancelled spent no attempt of its own.
+
+    This session's own review: that turn's review covers the whole conversation, so the attempt goes back
+    and the pid stays (:func:`owed_review.refund`). Another session's debt this process claimed (the
+    finite-turn drain): the claim goes back too, for the next run (:func:`owed_review.release`). A teardown
+    cancel, a failure or an exit-linger budget cut is not a supersede and still counts. Never raises.
+    Called before ``request_done`` is published, so the live turn's own mark sees the returned attempt."""
+    if review_run is None or not (review_run.superseded and review_run.cancel_requested.is_set()):
+        return
+    session, token = review_run.owed_session, review_run.owed_token
+    if not (session and token):
+        return
+    with suppress(Exception):
+        from agent import owed_review
+
+        if session == getattr(agent, "session_id", None):
+            owed_review.refund(session, token, reason="superseded_by_live_turn")
+        else:
+            owed_review.release(session, token)
+            logger.info("Owed review superseded by a live turn; claim returned: session=%s", session)
 
 
 def _review_callback_text(actions: list[str]) -> str:
@@ -1512,6 +1544,7 @@ def _run_review_in_thread(
     See #84423.
     """
     if review_run is not None and review_run.cancel_requested.is_set():
+        _return_superseded_owed_attempt(agent, review_run)
         finish_background_review_run(agent, review_run)
         return
     _set_thread_approval_callback(_bg_review_auto_deny)
