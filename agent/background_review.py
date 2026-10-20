@@ -40,6 +40,7 @@ class _BackgroundReviewRun:
         self.owed_token: Optional[str] = None
         # Cancelled by a new live turn of the same agent (not a teardown): an owed attempt is returned.
         self.superseded = False
+        self._attempt_returned = False
 
     def begin_request(self, review_agent: Any) -> bool:
         """Atomically admit the first provider-capable review phase."""
@@ -58,6 +59,14 @@ class _BackgroundReviewRun:
                 return None
             self._cancel_dispatched = True
             return self._review_agent
+
+    def claim_attempt_return(self) -> bool:
+        """Latch the superseded run's attempt return: at most once per run, and only for a live-turn supersede."""
+        with self._lock:
+            if self._attempt_returned or not (self.superseded and self.cancel_requested.is_set()):
+                return False
+            self._attempt_returned = True
+            return True
 
     def mark_request_finished(self) -> bool:
         """Latch request completion once; the caller publishes the event."""
@@ -176,6 +185,12 @@ def cancel_background_review_for_live_turn(
             _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS,
             message,
         )
+        if superseded:
+            # The live turn proceeds and its own finalize_turn will replace the owed token, so the slow
+            # fork's later return could no longer refund it: return this session's attempt now, while its
+            # token is still current. Another session's claim stays held until the fork exits (releasing it
+            # now would let a second review of that session start beside this one).
+            _return_superseded_owed_attempt(agent, run, own_session_only=True)
 
 
 # Aux-model routing: by default ("auto") the fork runs on the MAIN model and replays the full
@@ -1470,23 +1485,34 @@ def _settle_owed_review(review_run: Optional[_BackgroundReviewRun]) -> None:
             owed_review.settle(session, token)
 
 
-def _return_superseded_owed_attempt(agent: Any, review_run: Optional[_BackgroundReviewRun]) -> None:
+def _return_superseded_owed_attempt(
+    agent: Any, review_run: Optional[_BackgroundReviewRun], *, own_session_only: bool = False,
+) -> None:
     """``carry_owed_reviews``: a review the agent's next live turn cancelled spent no attempt of its own.
 
     This session's own review: that turn's review covers the whole conversation, so the attempt goes back
     and the pid stays (:func:`owed_review.refund`). Another session's debt this process claimed (the
     finite-turn drain): the claim goes back too, for the next run (:func:`owed_review.release`). A teardown
     cancel, a failure or an exit-linger budget cut is not a supersede and still counts. Never raises.
-    Called before ``request_done`` is published, so the live turn's own mark sees the returned attempt."""
+
+    Two callers, at most one return per run (:meth:`_BackgroundReviewRun.claim_attempt_return`): the fork's
+    exit, before ``request_done`` is published, so the live turn's own mark sees the returned attempt; and
+    the live-turn canceller when the fork has not acknowledged within its bounded wait (``own_session_only``),
+    so the attempt is returned while its token is still the current one."""
     if review_run is None or not (review_run.superseded and review_run.cancel_requested.is_set()):
         return
     session, token = review_run.owed_session, review_run.owed_token
     if not (session and token):
         return
+    own = session == getattr(agent, "session_id", None)
+    if own_session_only and not own:
+        return
+    if not review_run.claim_attempt_return():
+        return
     with suppress(Exception):
         from agent import owed_review
 
-        if session == getattr(agent, "session_id", None):
+        if own:
             owed_review.refund(session, token, reason="superseded_by_live_turn")
         else:
             owed_review.release(session, token)
