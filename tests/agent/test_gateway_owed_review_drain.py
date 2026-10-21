@@ -182,14 +182,30 @@ def test_no_drain_outside_a_finite_gateway_turn(home, monkeypatch, threads, fini
     assert threads == [] and owed_review.read("old")["attempts"] == 0
 
 
-def test_no_drain_for_an_interrupted_turn_or_with_the_flag_off(home, monkeypatch, threads):
+def test_an_interrupted_finite_turn_still_pays_one_other_sessions_debt(home, monkeypatch, threads, caplog):
+    """MER-1293: Paperclip cancels a board run that reassigns its own issue, so a hand-off ends interrupted."""
+    _cfg(monkeypatch, carry_owed_reviews=True)
+    _orphan("old")
+    owed_review.mark_owed("current", memory=True, skills=True, reason="turn_interrupted", spawning=False)
+    agent = _gateway_agent(_DB({"old": TRANSCRIPT, "current": TRANSCRIPT}))
+    with finite_turn_scope(True), caplog.at_level("INFO", logger=br.logger.name):
+        assert br.schedule_owed_review_drain(agent, interrupted=True) is True
+        (thread,) = threads
+        thread.target()
+    assert [kw["owed_session"] for kw in agent.spawned] == ["old"]  # never its own, still-owed debt
+    assert _marker("old") is None
+    assert owed_review.owed_kinds("current") == (True, True)       # left for its own session / a later run
+    assert "owed review completed (session=current, after an interrupted turn)" in caplog.text
+
+
+def test_no_drain_with_the_flag_off_or_for_no_agent_or_cron(home, monkeypatch, threads):
     _cfg(monkeypatch, carry_owed_reviews=True)
     _orphan("old")
     agent = _gateway_agent(_DB({"old": TRANSCRIPT}))
     with finite_turn_scope(True):
-        assert br.schedule_owed_review_drain(agent, interrupted=True) is False
         _cfg(monkeypatch)                                       # carry_owed_reviews off
         assert br.schedule_owed_review_drain(agent) is False
+        assert br.schedule_owed_review_drain(agent, interrupted=True) is False
         _cfg(monkeypatch, carry_owed_reviews=True, enabled=False)
         assert br.schedule_owed_review_drain(agent) is False
         _cfg(monkeypatch, carry_owed_reviews=True)
@@ -259,7 +275,7 @@ def _turn(agent, *, interrupted=False, final_response="ok"):
 
 @pytest.mark.parametrize("finite, interrupted, final_response, expected", [
     (True, False, "ok", [False]),         # a finished finite gateway turn schedules one drain
-    (True, True, "ok", [True]),           # an interrupted one is told so (and starts nothing)
+    (True, True, "ok", [True]),           # an interrupted one is told so (and still drains, MER-1293)
     (True, False, None, [True]),          # no final response: treated as interrupted
 ])
 def test_finalize_turn_schedules_the_drain(home, monkeypatch, finite, interrupted, final_response, expected):
