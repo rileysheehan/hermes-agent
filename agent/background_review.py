@@ -392,14 +392,21 @@ def schedule_owed_review_drain(agent: Any, *, interrupted: bool = False) -> bool
     (a finished board run, a killed one). Here the gateway, which outlives the viewer, does what the
     linger did: after THIS turn's own review has finished, pay ONE owed review of another session of the
     profile (:func:`drain_owed_review`: oldest first, writer gone or stale, same budget and claim rules),
-    on a daemon thread so the turn's delivery is never held. An interrupted (stopped, disconnected) turn
-    does not start one. Returns True when the drain thread was started. Never raises.
+    on a daemon thread so the turn's delivery is never held. Returns True when the drain thread was
+    started. Never raises.
+
+    An interrupted turn drains too (``interrupted`` only labels the log line). Paperclip cancels a board
+    run the moment it reassigns its own issue (``issue_reassigned``), so a run that hands its work on
+    always ends interrupted: its own review is left owed, and if it also paid nothing, a profile whose
+    runs end in a hand-off (an auditor that reassigns every finding) owed more each run than its rare
+    finished turns could pay (MER-1293: 9 debts, the oldest past 24 h, all with 0 attempts). The
+    turn's own debt is not taken here: its writer, this gateway, is alive (``ORPHAN_AFTER_S``).
     """
     from agent.evaluation_policy import active
     if active(agent):
         return False
     try:
-        if agent is None or interrupted:
+        if agent is None:
             return False
         from gateway.session_finite import finite_turn_required
 
@@ -421,8 +428,9 @@ def schedule_owed_review_drain(agent: Any, *, interrupted: bool = False) -> bool
                 if done is not None and not done.wait(budget):
                     return  # this turn's own review is still running; a later turn tries again
                 if drain_owed_review(agent, budget=budget - (time.monotonic() - started)):
-                    logger.info("Finite gateway turn: owed review completed (session=%s)",
-                                getattr(agent, "session_id", None) or "<unknown>")
+                    logger.info("Finite gateway turn: owed review completed (session=%s%s)",
+                                getattr(agent, "session_id", None) or "<unknown>",
+                                ", after an interrupted turn" if interrupted else "")
             except Exception:  # best-effort, off the turn's path
                 logger.warning("Owed review drain after a finite gateway turn failed", exc_info=True)
 
