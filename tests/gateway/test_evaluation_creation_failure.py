@@ -76,6 +76,7 @@ async def test_failed_evaluation_quarantines_production_but_can_recover_as_evalu
         assert_unpublished(owner, sid, route)
     connection = object.__new__(AuthorityConnection)
     connection.authority, connection.actor = owner, actor
+    connection.native_owner, connection.transport = False, None  # read by v0.22.5 create()
     with pytest.raises(RuntimeStoreError, match='evaluation_isolation_unproven'):
         await connection.create(None, {**params, 'title': 'ordinary retry after failed evaluation'})
     assert_unpublished(owner, sid, route)

@@ -93,7 +93,8 @@ async def test_fresh_only_atomic_two_connections_same_title_or_identity(tmp_path
         assert sorted(await asyncio.gather(commit(authority.db, one), commit(other, two))) == ['admission_conflict', 'created']
         winner = one if authority.db.get_session(one['session_id']) else two
         with pytest.raises(RuntimeStoreError, match='admission_conflict'):
-            commit_local_session(other, epoch=authority.epoch, receipt=copy.deepcopy(winner))
+            # v0.22.5 receipts carry an on_create publication (holds a lock): copy the plain mapping.
+            commit_local_session(other, epoch=authority.epoch, receipt=copy.deepcopy(dict(winner)))
         with authority.db._read_ctx() as conn:
             assert conn.execute('SELECT count(*) FROM sessions').fetchone()[0] == 1
             assert conn.execute('SELECT title_source FROM sessions').fetchone()[0] == 'user'

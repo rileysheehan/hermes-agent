@@ -13,10 +13,10 @@ from typing import Iterable, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
 # Markdown ``[label](url)`` targets and bare URLs, in order of appearance.
-_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'`]+", re.I)
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'`]+", re.IGNORECASE)
 
 
-def parse_skip_hosts(value) -> Tuple[str, ...]:
+def parse_skip_hosts(value) -> tuple[str, ...]:
     """The configured host list: a YAML list or a comma/space separated string; lower-case, no scheme, no port."""
     if not value:
         return ()
@@ -43,7 +43,7 @@ def _skipped(host: str, skip: Iterable[str]) -> bool:
     return any(host == s or host.endswith("." + s) for s in skip)
 
 
-def link_preview_choice(text: Optional[str], skip_hosts: Iterable[str]) -> Union[None, bool, str]:
+def link_preview_choice(text: Optional[str], skip_hosts: Iterable[str]) -> None | bool | str:
     """None: leave Telegram's default. False: no card (every link goes to a skipped host). A URL string: preview
     that link (the first link is skipped but a later one is not)."""
     skip = tuple(skip_hosts or ())

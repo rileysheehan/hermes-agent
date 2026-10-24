@@ -27,7 +27,7 @@ from agent import managed_authority
 load_hermes_dotenv()
 discover_plugins()
 from model_tools import get_tool_definitions
-from agent.managed_worker import WORKER_DISABLED_TOOLSETS
+WORKER_DISABLED_TOOLSETS = ()  # v0.22.5's managed worker disables no toolset (delegation runs there now)
 from tools import tool_search
 full = get_tool_definitions(['terminal', 'file'], list(WORKER_DISABLED_TOOLSETS), quiet_mode=True, skip_tool_search_assembly=True)
 visible = get_tool_definitions(['terminal', 'file'], list(WORKER_DISABLED_TOOLSETS), quiet_mode=True)

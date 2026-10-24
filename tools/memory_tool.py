@@ -201,7 +201,7 @@ def _background_delete_gate(store, action, operations, target="memory", content=
     return _stage_consolidation(store, payload)
 
 
-def _stage_consolidation(store, payload: Dict[str, Any]) -> Optional[str]:
+def _stage_consolidation(store, payload: dict[str, Any]) -> Optional[str]:
     """Stage an unattended review's replace/remove for ``/memory pending`` (#105921)."""
     is_batch = payload.get("action") == "batch"
     operations = payload.get("operations") if is_batch else None
@@ -255,7 +255,7 @@ def consolidation_archive_path() -> Path:
     return get_memory_dir() / "consolidated.jsonl"
 
 
-def _consolidation_replacement(op: Dict[str, Any]) -> Optional[str]:
+def _consolidation_replacement(op: dict[str, Any]) -> Optional[str]:
     """The text that takes the archived entry's place: a replace's new entry, a patch's entry with its one span
     spliced (the store applies the same splice), None for a remove or a patch the store will refuse."""
     content = op.get("content") if op.get("content") is not None else op.get("new_text")
@@ -267,7 +267,7 @@ def _consolidation_replacement(op: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _archive_before_consolidation(store, payload: Dict[str, Any]) -> Optional[str]:
+def _archive_before_consolidation(store, payload: dict[str, Any]) -> Optional[str]:
     """Pin and archive the FULL entry each replace/patch/remove selects now, then let the write proceed
     (None). Fails closed to the staging path if the search fails or the archive cannot be written:
     an entry is never overwritten without its record."""
@@ -283,8 +283,7 @@ def _archive_before_consolidation(store, payload: Dict[str, Any]) -> Optional[st
         path = consolidation_archive_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
             fh.flush()
             os.fsync(fh.fileno())
     except Exception:

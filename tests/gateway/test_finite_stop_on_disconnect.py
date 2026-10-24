@@ -75,7 +75,7 @@ class _Store:
         self.status, self.handle = "terminal", gen
 
     # authority surface
-    async def submit(self, actor, submission):
+    async def submit(self, actor, submission, **kwargs):  # queue_while_restarting (v0.22.5)
         self.submitted.append(submission)
         return types.SimpleNamespace(status="queued", admission_id="adm-1", execution_generation=None)
 
@@ -110,7 +110,9 @@ def _conn(tmp_path, *, on=True, native=True, **store):
     (tmp_path / "config.yaml").write_text(f"gateway:\n  finite_stop_on_disconnect: {'true' if on else 'false'}\n")
     conn = object.__new__(AuthorityConnection)
     conn.authority = _Store(tmp_path, **store)
-    conn.actor = object()
+    conn.actor = types.SimpleNamespace(subject="owner")  # v0.22.5 submit keys voice stops by subject
+    conn._operator = None
+    conn._typed_voice_stop = _no_typed_voice_stop
     conn.native_owner = native
     conn.subscriptions = {"s1": object()}
     conn._finite_owned = {}
@@ -234,3 +236,8 @@ def test_a_non_finite_submission_is_never_tracked(tmp_path):
     conn = _conn(tmp_path, status="started", generation=7, handle=7)
     _submit(conn, finite=False)
     assert conn._finite_owned == {}
+
+
+async def _no_typed_voice_stop(ref, params):
+    """v0.22.5 submit first checks for a typed voice-chat stop phrase; these fakes have no voice chat."""
+    return False

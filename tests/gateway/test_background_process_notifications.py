@@ -333,7 +333,8 @@ async def test_post_turn_watch_drain_refused_event_backs_off_and_is_kept(monkeyp
     import logging
 
     from gateway import run_notifications
-    from gateway.run_notifications import _WATCH_INJECTION_RETRY_BASE_DELAY, _WATCH_INJECTION_RETRY_MAX_DELAY
+    from gateway.run_notifications import _COMPLETION_INJECTION_RETRY_MAX_DELAY as _WATCH_INJECTION_RETRY_MAX_DELAY
+    from gateway.run_notifications import _WATCH_INJECTION_RETRY_BASE_DELAY
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     completion_queue = queue.Queue()

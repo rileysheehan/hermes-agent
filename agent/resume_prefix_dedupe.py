@@ -76,7 +76,7 @@ def reference_text(chars: int, sha256: str) -> str:
     )
 
 
-def _consume_env() -> Optional[Tuple[str, int]]:
+def _consume_env() -> Optional[tuple[str, int]]:
     # A gateway-run finite turn reads the opt-in its client forwarded (gateway.client_env_passthrough);
     # an in-process one-shot reads its own environment. Either way it is consumed once.
     sha = raw_chars = None
@@ -103,14 +103,14 @@ def _consume_env() -> Optional[Tuple[str, int]]:
 
 def decide(
     user_message: Any,
-    conversation_history: Optional[List[Dict[str, Any]]],
+    conversation_history: Optional[list[dict[str, Any]]],
     *,
     sha256: str,
     chars: int,
     protect_first_n: int,
     effective_protect_first_n: int,
     is_summary,
-) -> Tuple[Optional[str], Optional[int], str]:
+) -> tuple[Optional[str], Optional[int], str]:
     """Pure decision. Returns ``(new_message, first_user_index, reason)``; ``new_message`` is None to keep."""
     if not isinstance(user_message, str) or len(user_message) < chars:
         return None, None, "message_shorter_than_block"
@@ -139,7 +139,7 @@ def decide(
     return reference_text(chars, sha256) + user_message[chars:], first, "deduplicated"
 
 
-def wire_prefix_carries_block(agent: Any, history: Optional[List[Dict[str, Any]]], sha256: str, chars: int) -> bool:
+def wire_prefix_carries_block(agent: Any, history: Optional[list[dict[str, Any]]], sha256: str, chars: int) -> bool:
     """Will the replayed prefix of this turn's requests still open its first user message with the block?
 
     Projects ``history`` exactly as ``build_api_messages`` does for the rows before the current turn: the shared
@@ -160,7 +160,7 @@ def wire_prefix_carries_block(agent: Any, history: Optional[List[Dict[str, Any]]
     return isinstance(wire, str) and len(wire) >= chars and _sha(wire[:chars]) == sha256
 
 
-def _message_texts(message: Dict[str, Any]) -> List[Tuple[Optional[int], str]]:
+def _message_texts(message: dict[str, Any]) -> list[tuple[Optional[int], str]]:
     """``(part index or None, text)`` for a wire message's string content or its text parts."""
     content = message.get("content")
     if isinstance(content, str):
@@ -171,14 +171,14 @@ def _message_texts(message: Dict[str, Any]) -> List[Tuple[Optional[int], str]]:
     return []
 
 
-def _set_text(message: Dict[str, Any], part: Optional[int], text: str) -> None:
+def _set_text(message: dict[str, Any], part: Optional[int], text: str) -> None:
     if part is None:
         message["content"] = text
     else:
         message["content"][part] = {**message["content"][part], "text": text}
 
 
-def _wire_outcome(api_messages: List[Dict[str, Any]], line: str, block: str) -> Tuple[str, Optional[Tuple[int, Optional[int], int]]]:
+def _wire_outcome(api_messages: list[dict[str, Any]], line: str, block: str) -> tuple[str, Optional[tuple[int, Optional[int], int]]]:
     """Classify one assembled request. Returns ``(outcome, location of the reference to restore)``.
 
     ``verified``: the reference is there and a user message earlier in the request (or earlier in the same text)
@@ -269,7 +269,7 @@ def report_turn(agent: Any) -> Optional[str]:
 
 def apply_to_turn(
     agent: Any,
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     current_turn_user_idx: int,
     *,
     persist_user_message: Any = None,
@@ -363,7 +363,7 @@ def verify_final_transcript(agent: Any, messages: Any) -> Optional[bool]:
 def apply_resume_prefix_dedupe(
     agent: Any,
     user_message: Any,
-    conversation_history: Optional[List[Dict[str, Any]]],
+    conversation_history: Optional[list[dict[str, Any]]],
     persist_user_message: Any = None,
 ) -> Any:
     """Decision core on an explicit history (tests and replay). Never raises; any doubt returns ``user_message``."""

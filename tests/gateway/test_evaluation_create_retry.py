@@ -62,6 +62,7 @@ async def test_conflicting_evaluation_retry_leaves_production_unchanged(world, c
         if canonical:
             connection = object.__new__(AuthorityConnection)
             connection.authority, connection.actor = owner, actor
+            connection.native_owner, connection.transport = False, None  # read by v0.22.5 create()
             await connection.create(None, {**params, 'evaluation_isolation': 1,
                                            'title': 'new neutral evaluation title'})
         else:

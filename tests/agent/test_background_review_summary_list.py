@@ -7,7 +7,7 @@ from agent import background_review as br
 
 def _published(actions, profile=None, monkeypatch=None):
     if monkeypatch is not None:
-        import hermes_cli.profiles as profiles
+        from hermes_cli import profiles
         monkeypatch.setattr(profiles, "current_profile_name", lambda default=None: profile)
     got = []
     agent = SimpleNamespace(suppress_status_output=True, background_review_callback=got.append,

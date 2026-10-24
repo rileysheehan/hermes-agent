@@ -64,28 +64,33 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
-# Drain retries of a refused watch event (#140899): capped backoff, 4 s doubling to 60 s, and
-# no attempt cap. A refused event is never dropped (``False`` is retryable; the base tree retried
-# it every tick forever), so a refusal that never clears costs one attempt a minute per event.
-# Upstream PR #140911 instead drops after 8 attempts; Mercury does not, so nothing it would have
-# delivered is lost (MER-1177 review).
+# Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
+_MAX_COMPLETION_INJECTION_ATTEMPTS = 8
+_COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
+# Drain retries of a refused watch event follow the same bounded backoff (4 s doubling to 60 s), keyed
+# to the 2 s drain cadence instead of the watcher's check interval (#140899). Mercury never drops a
+# refused watch event, permanent-looking or not: a suspended route answers ``not_found`` and can
+# clear after upstream's 8-attempt budget (MER-1177 review), so a refusal that never clears costs
+# one attempt a minute per event instead.
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
-_WATCH_INJECTION_RETRY_MAX_DELAY = 60
 
 
 def _watch_retry_clock() -> float:
-    """Clock for the watch-drain retry backoff (a module seam so tests never patch ``time``)."""
+    """The drain's backoff clock (a test seam: asyncio itself also reads ``time.monotonic``)."""
     return time.monotonic()
+
+
+def _refusal_retry_at(step: int) -> float:
+    """When a refused queued notice is next offered: exponential from the drain base, capped."""
+    return _watch_retry_clock() + jittered_backoff(
+        step, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
+        max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
 
 
 def _watch_event_ref(evt: dict) -> str:
     """The producer-stable id of one watch event (each pattern hit has its own ``event_id``)."""
     return str(evt.get("event_id") or "-")
 
-
-# Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
-_MAX_COMPLETION_INJECTION_ATTEMPTS = 8
-_COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -129,6 +134,28 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
+def _local_completion_card(evt: dict) -> dict[str, str]:
+    """The card of a local process notice: the async-result card the in-process TUI wrote for a
+    completion or async delegation (a gateway-side ``/review`` reports as one), and a liveness tick's
+    one-line receipt. The claim's ``message.start`` carries it, and an idle classic CLI only opens a
+    turn that has one. ``{}`` for a watch match."""
+    from tools.process_registry_notifications import (
+        PROCESS_COMPLETE_DISPLAY_KIND, async_delegation_display_text, process_completion_display_text)
+    evt_type = evt.get("type", "completion")
+    if evt_type == "completion":
+        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
+                "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
+    if evt_type == "async_delegation":
+        return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
+    if evt_type == "heartbeat":
+        # The wake stays machinery (no bubble, and a quiet tick may end in silence); the receipt lets an
+        # idle CLI open the turn with one line and show the agent's reply.
+        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+        from tools.process_registry_notifications import heartbeat_display_text
+        return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
+    return {}
+
+
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     """Synthetic-event metadata for a watch/completion notification: routing pins, proof ids,
     automation identities, and the local async-result card."""
@@ -144,13 +171,10 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
         metadata["gateway_session_id"] = parent_session_id
     if evt.get('_automation_identities'):
         metadata['automation_identities'] = evt['_automation_identities']
-    if source.platform == Platform.LOCAL and evt.get("type", "completion") == "completion":
-        # A local completion persists as the async-result card the in-process TUI wrote;
-        # messaging rows stay internal_notification, as on main.
-        from tools.process_registry_notifications import (
-            PROCESS_COMPLETE_DISPLAY_KIND, process_completion_display_text)
-        metadata["display_kind"] = PROCESS_COMPLETE_DISPLAY_KIND
-        metadata["display_text"] = evt.get("_display_text") or process_completion_display_text([evt])
+    if source.platform == Platform.LOCAL:
+        # A local completion persists as the async-result card the in-process TUI wrote, and a tick
+        # carries its CLI receipt; messaging rows stay internal_notification, as on main.
+        metadata.update(_local_completion_card(evt))
     proven_session_id = str(evt.get("proven_session_id") or "").strip()
     if proven_session_id:
         metadata["gateway_proven_session_id"] = proven_session_id
@@ -722,40 +746,52 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     continue
                 if self._load_background_notifications_mode() == "off":
                     continue
-                synth_text = _format_gateway_process_notification(evt)
-                if not synth_text:
-                    continue
-                try:
-                    delivered = await self._inject_watch_notification(synth_text, evt)
-                except Exception:
-                    logger.exception("Watch notification injection error")
-                    delivered = False
+                if evt.get("type") == "heartbeat":
+                    from gateway.session_automation import deliver_heartbeat
+                    delivered = await deliver_heartbeat(self, evt)
+                else:
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        delivered = await self._inject_watch_notification(synth_text, evt)
+                    except Exception:
+                        logger.exception("Watch notification injection error")
+                        delivered = False
+            # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
-                attempts = int(evt.get("_watch_injection_attempts") or 0) + 1
-                evt["_watch_injection_attempts"] = attempts
-                # Never drop: a refusal may clear at any time (adapter reconnecting, store draining,
-                # a suspended route coming back), and ``False`` is the retryable contract. Back off
-                # instead, so a refusal that never clears costs one attempt a minute, not one a tick
-                # (#140899). The line names the event, so a check can bound attempts per event.
-                from agent.retry_utils import jittered_backoff
-                delay = jittered_backoff(attempts, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
-                                         max_delay=_WATCH_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
-                evt["_watch_next_retry_at"] = _watch_retry_clock() + delay
-                completion_queue.put(evt)
-                logger.warning(
-                    "Watch notification refused for %s chat=%s event=%s proc=%s type=%s attempt=%d "
-                    "code=%s; retrying in %ds",
-                    evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
-                    evt.get("session_id") or "?", evt.get("type") or "?", attempts,
-                    evt.pop("_watch_last_refusal", None) or "unadmitted", int(delay),
-                )
+                self._requeue_refused_watch_event(completion_queue, evt)
             elif delivered:
                 logger.info(
                     "Watch notification admitted for %s chat=%s event=%s proc=%s type=%s attempts=%d",
                     evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
                     evt.get("session_id") or "?", evt.get("type") or "?",
-                    int(evt.get("_watch_injection_attempts") or 0) + 1,
+                    int(evt.get("_watch_retry_step") or 0) + 1,
                 )
+
+    @staticmethod
+    def _requeue_refused_watch_event(completion_queue, evt: dict) -> None:
+        """Retry a refused watch event on a bounded backoff, never on every 2 s tick (#140899).
+
+        Mercury never drops it, whatever the refusal: ``False`` is the retryable contract, and a
+        refusal upstream counts as permanent (``not_found`` from a suspended route) can still clear
+        after its 8-attempt budget (MER-1177 review). A refusal that never clears costs one attempt
+        a minute per event. Each refusal logs one line naming the event, its attempt and the refusal
+        code, so an outcome check can bound attempts per event and tell delivery from refusal.
+        """
+        step = int(evt.get("_watch_retry_step") or 0) + 1
+        evt["_watch_retry_step"] = step
+        evt.pop("_refusal_permanent", None)
+        retry_at = _refusal_retry_at(step)
+        evt["_watch_next_retry_at"] = retry_at
+        completion_queue.put(evt)
+        logger.warning(
+            "Watch notification refused for %s chat=%s event=%s proc=%s type=%s attempt=%d "
+            "code=%s; retrying in %ds",
+            evt.get("platform") or "?", evt.get("chat_id") or "?", _watch_event_ref(evt),
+            evt.get("session_id") or "?", evt.get("type") or "?", step,
+            evt.pop("_watch_last_refusal", None) or "unadmitted", round(retry_at - _watch_retry_clock()),
+        )
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
@@ -855,7 +891,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
         Routing comes from the queued event, never the active foreground message. Returns
         ``True`` on adapter acceptance, ``False`` on retryable adapter failure, ``None`` with no
-        gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
+        gateway route or a refused notice pinned to a permanently-gone session (``_watch_pin_gone``).
+        Not transactional: a crash after acceptance can replay (at-least-once).
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
@@ -922,17 +959,25 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             from gateway.session_authorities import active_authority
             authority = active_authority(self)
             if authority is not None:
-                from gateway.session_automation import producer_identity
+                from gateway.session_automation import admit_process_notice
                 from hermes_state_runtime import RuntimeStoreError
                 try:
-                    identity = producer_identity(self, evt)
-                    await authority.admit_automation(adapter, synth_event, identity)
+                    await admit_process_notice(self, authority, adapter, synth_event, evt)
                 except RuntimeStoreError as exc:
-                    raise WakeNotAccepted(str(exc)) from exc
+                    raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
             else:
                 await admit_internal_event(adapter, synth_event)
             return True
         except WakeNotAccepted as exc:
+            # Permanent only on proof: a pin the authority's state shows gone (/new, #141562) or a
+            # final code. An unowned or foreign-pinned refusal may still find its owner (d6635ffe03b).
+            from gateway.wake import PERMANENT_REFUSAL_REASONS
+            pin_gone = await self._watch_pin_gone(evt, str(exc), log=not raise_not_accepted)
+            exc.permanent = pin_gone or exc.reason in PERMANENT_REFUSAL_REASONS
+            if pin_gone and not raise_not_accepted:
+                return None
+            if not raise_not_accepted:
+                evt["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
             logger.warning("Watch notification not admitted for %s chat=%s: %s",
                            platform_name, source.chat_id, exc)
             # Durable callers refund the claim; ordinary watch callers just requeue.
@@ -965,7 +1010,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 task_idx = ((evt.get("results") or [{}])[0] or {}).get("task_index", "")
                 return (evt_type, producer_id, f"task_failure:{task_idx}")
             return (evt_type, producer_id, "")
-        if evt_type in {"watch_match", "watch_disabled"} and evt.get("event_id"):
+        # A liveness tick is one watch event like a match: without an identity the session authority
+        # refuses it and the drain requeues it forever.
+        if evt_type in {"watch_match", "watch_disabled", "heartbeat"} and evt.get("event_id"):
             return (evt_type, str(evt["session_id"]), str(evt["event_id"]))
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
@@ -1024,7 +1071,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             parent_session_id, entry.session_id if entry else "",
         )
         target_session_id = parent_session_id
-        if verdict == "deliver" and parent is not None and parent.get("ended_at"):
+        # A local conversation a viewer closed keeps its own work as a note on its closed tip (#134889 LC-7).
+        closed_tip = await self._closed_local_target(session_db, entry, parent_session_id, parent)
+        if closed_tip:
+            verdict, target_session_id = "deliver", closed_tip
+        elif verdict == "deliver" and parent is not None and parent.get("ended_at"):
             end_reason = str(parent.get("end_reason") or "")
             if end_reason != "compression":
                 # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
@@ -1233,8 +1284,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 with self._completion_delivery_lock:
                     self._mark_completions_delivered_locked((identity,))
             return True
-        except WakeNotAccepted:
-            refused = True
+        except WakeNotAccepted as exc:
+            # A proven-permanent refusal spends its durable attempt, so the row converges to
+            # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
+            # not yet proven) is refunded and never drops a completion the owner will take later.
+            refused = not exc.permanent
             return False
         finally:
             if identity_claimed and not accepted:
@@ -1582,9 +1636,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     self._enrich_async_delegation_routing(evt)
                     groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
                 for group in groups.values():
+                    if any(evt.get("_watch_next_retry_at", 0) > time.monotonic() for evt in group):
+                        for evt in group:
+                            _pr.completion_queue.put(evt)
+                        continue
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:
+                            self._back_off_refused_completions(group)
                             for evt in group:
                                 _pr.completion_queue.put(evt)
                     except Exception as e:
@@ -1592,6 +1651,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             await asyncio.sleep(interval)
+
+    @staticmethod
+    def _back_off_refused_completions(group: list[dict]) -> None:
+        """Space out an undelivered async group's retries instead of re-offering it every 2 s pass.
+        The backoff only paces; the durable ledger decides when a row gives up (a permanent refusal
+        spends a delivery attempt there, so the count survives restarts) (#141153)."""
+        for evt in group:
+            step = int(evt.get("_watch_retry_step") or 0) + 1
+            evt["_watch_retry_step"] = step
+            evt["_watch_next_retry_at"] = _refusal_retry_at(step)
 
     @staticmethod
     def _redacted_output_tail(session, limit: int) -> str:
