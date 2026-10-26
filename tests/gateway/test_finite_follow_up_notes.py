@@ -202,3 +202,73 @@ def test_unreadable_row_fails_closed_only_with_the_setting_on(tmp_path):
     _setting(tmp_path)
     assert follows_finite_turn(authority, {}) is True
     assert follows_finite_turn(authority, {'seq': True, 'target_session_id': 's'}) is True
+
+
+def _settle_claimed(authority, ref, outcome):
+    """Claim the FIFO head and settle it as its run would (``interrupted``: the stopped board run)."""
+    from hermes_state_runtime import claim_session_input, settle_session_input
+    claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=ref.session_id)
+    settle_session_input(authority.db, epoch=authority.epoch, admission_id=claimed['admission_id'],
+                         generation=claimed['generation'], outcome=outcome)
+
+
+def _withdraw(authority, ref, request_id, text, finite):
+    from hermes_state_runtime import cancel_session_input
+    row = _client(authority, ref, request_id, text, finite)
+    cancelled = cancel_session_input(authority.db, epoch=authority.epoch, admission_id=row['admission_id'])
+    assert cancelled['outcome'] == 'cancelled' and cancelled['generation'] is None
+    return cancelled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tick', [False, True], ids=['completion-attached', 'tick-unviewed'])
+@pytest.mark.parametrize('interrupted', [False, True], ids=['completed-finite', 'interrupted-finite'])
+async def test_withdrawn_interactive_input_leaves_the_finite_boundary(tmp_path, monkeypatch, tick, interrupted):
+    """MER-1528 review: an interactive prompt cancelled while queued never ran, so it is not the client
+    turn that makes producer inputs turns again."""
+    from hermes_state_runtime import get_session_admission
+    runner, authority, ref, actor = await _local(tmp_path, monkeypatch)
+    _setting(tmp_path)
+    try:
+        target = _target(runner, authority, ref)
+        _attach(authority, ref, actor)
+        _client(authority, ref, 'run-1', 'BOARD', finite=True)
+        seen = _turns(runner, authority, target)
+        if interrupted:
+            _settle_claimed(authority, ref, 'interrupted')
+        else:
+            await authority._drain(ref)
+        withdrawn = _withdraw(authority, ref, 'withdrawn', 'NEVER RUN THIS', finite=False)
+        if tick:
+            authority.sessions[ref.session_id].subscribers.clear()
+            await _admit(runner, authority, ref, '["heartbeat","proc_tick","evt-1"]', '[running] RESULT_tick')
+        else:
+            await _deliver(runner, authority, ref, _PROCESS)
+        await authority._drain(ref)
+        assert seen == ([] if interrupted else [('BOARD', 0)]), f'a withdrawn prompt re-enabled a producer turn: {seen!r}'
+        assert get_session_admission(authority.db, admission_id=withdrawn['admission_id'])['outcome'] == 'cancelled'
+        assert len(_notes(authority, target)) == (0 if tick else 1)
+        assert [r['outcome'] for r in _admissions(authority, ref)] == ['completed']
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_withdrawn_finite_successor_does_not_override_an_interactive_turn(tmp_path, monkeypatch):
+    """The incident's row 1158 shape the other way round: a finite run withdrawn before it started is
+    not a finite turn either, so the interactive turn before it still decides."""
+    runner, authority, ref, actor = await _local(tmp_path, monkeypatch)
+    _setting(tmp_path)
+    try:
+        target = _target(runner, authority, ref)
+        _attach(authority, ref, actor)
+        _client(authority, ref, 'chat', 'HELLO', finite=False)
+        seen = _turns(runner, authority, target)
+        await authority._drain(ref)
+        _withdraw(authority, ref, 'run-2', 'WITHDRAWN RUN', finite=True)
+        await _deliver(runner, authority, ref, _PROCESS)
+        await authority._drain(ref)
+        assert [text for text, _ in seen] == ['HELLO', _COMPLETION_TEXT]
+        assert _notes(authority, target) == []
+    finally:
+        authority.db.close()
