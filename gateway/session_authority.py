@@ -1051,7 +1051,7 @@ class SessionAuthority:
                 from gateway.session_local_recovery import reopen_local_session
                 from gateway.session_runtime_workers import tracked_write
                 from gateway.session_completion_notes import noted_completion
-                if not noted_completion(first):  # a note leaves a closed row closed (session_completion_notes)
+                if not noted_completion(first, self):  # a note leaves a closed row closed (session_completion_notes)
                     await tracked_write(self, partial(reopen_local_session, self, ref))
             if first is not None and 'native_text_v1' in first['payload']:
                 from gateway.session_envelope import check_native_route
