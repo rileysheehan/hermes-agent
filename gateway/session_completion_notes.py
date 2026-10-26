@@ -52,9 +52,21 @@ def noted_completion(row, authority=None):
     return authority is not None and _process_tick(row) and follows_finite_turn(authority, row)
 
 
+# The newest client input before a producer row that ran as a turn of its own: claimed (a generation)
+# and settled by its run. A row withdrawn while queued (``cancelled``, no generation) never ran, and a
+# ``steering`` row joined the turn it was handed to, which is itself the row that decides. Any other or
+# future outcome is skipped too, so an unrecognised row can only leave the earlier finite boundary in
+# force (a note), never clear it (MER-1528 review).
+_PRIOR_CLIENT_TURN = (
+    "SELECT payload_json FROM session_admissions WHERE target_session_id=? AND seq<? "
+    "AND substr(principal_id,1,11) != 'automation:' AND status='terminal' AND generation IS NOT NULL "
+    "AND outcome IN ('completed','interrupted','failed') ORDER BY seq DESC LIMIT 1")
+
+
 def follows_finite_turn(authority, row):
-    """``gateway.finite_stop_on_disconnect``: the newest client input before producer *row* was a
-    finite turn (``chat -q``), so *row* belongs to that run and is never a turn of its own (MER-1371).
+    """``gateway.finite_stop_on_disconnect``: the newest client turn that ran before producer *row* (see
+    ``_PRIOR_CLIENT_TURN``) was a finite turn (``chat -q``), so *row* belongs to that run and is never a
+    turn of its own (MER-1371).
 
     A finite turn is its submitting process's: an orchestrator that kills or times out that process
     expects the work to stop, as when the turn ran in-process and its background processes' wakes
@@ -62,8 +74,9 @@ def follows_finite_turn(authority, row):
     is claimed the moment that turn settles, while its client is still attached (it detaches only
     after reading the result), and a liveness tick is never noted. Either one started an unattended
     turn with no client and no board run (MER-1371: 49 model calls after the stop). Only a later client
-    input (an interactive turn, a message) makes producer inputs turns again; a successor finite turn
-    (``--resume``) is a client input and runs normally, and the producer inputs after it are its own.
+    turn that ran (an interactive turn, a message) makes producer inputs turns again; one withdrawn
+    before it ran does not; a successor finite turn (``--resume``) is a client turn and runs normally,
+    and the producer inputs after it are its own.
     Unreadable: treated as following a finite turn, so the failure is a note, never an unattended turn."""
     from gateway.session_finite import stop_on_disconnect
     if not stop_on_disconnect(authority):
@@ -73,10 +86,7 @@ def follows_finite_turn(authority, row):
         return True
     try:
         with authority.db._read_ctx() as conn:
-            prior = conn.execute(
-                "SELECT payload_json FROM session_admissions WHERE target_session_id=? AND seq<? "
-                "AND substr(principal_id,1,11) != 'automation:' ORDER BY seq DESC LIMIT 1",
-                (target, seq)).fetchone()
+            prior = conn.execute(_PRIOR_CLIENT_TURN, (target, seq)).fetchone()
         if prior is None:
             return False
         payload = json.loads(prior[0])
