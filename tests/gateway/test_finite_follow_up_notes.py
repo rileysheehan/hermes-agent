@@ -272,3 +272,92 @@ async def test_withdrawn_finite_successor_does_not_override_an_interactive_turn(
         assert _notes(authority, target) == []
     finally:
         authority.db.close()
+
+
+async def _producer(runner, authority, ref, tick):
+    if tick:
+        authority.sessions[ref.session_id].subscribers.clear()
+        await _admit(runner, authority, ref, '["heartbeat","proc_tick","evt-1"]', '[running] RESULT_tick')
+    else:
+        await _deliver(runner, authority, ref, _PROCESS)
+
+
+def _steer_into_claim(authority, ref, receiving, outcome, delivered=True):
+    """A plain-text input handed into the running claim with the real store, then settled with it."""
+    from gateway.session_queued_controls import queued_controls
+    from hermes_state_runtime import claim_session_input, get_session_admission, settle_session_input, steer_session_input
+    _client(authority, ref, 'receiving', receiving[0], finite=receiving[1])
+    claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=ref.session_id)
+    steer = _client(authority, ref, 'steer', 'JOIN THIS TURN', finite=False)
+    assert 'steer' in queued_controls(authority, steer), 'not a native steer shape'
+    transferred, fresh = steer_session_input(authority.db, epoch=authority.epoch,
+                                             admission_id=steer['admission_id'], generation=claimed['generation'])
+    assert fresh and transferred['outcome'] == 'steering'
+    settle_session_input(authority.db, epoch=authority.epoch, admission_id=claimed['admission_id'],
+                         generation=claimed['generation'], outcome=outcome,
+                         _transfers={steer['admission_id']: delivered})
+    return claimed, get_session_admission(authority.db, admission_id=steer['admission_id'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['completed', 'interrupted', 'failed'])
+@pytest.mark.parametrize('tick', [False, True], ids=['completion-attached', 'tick-unviewed'])
+async def test_a_steer_delivered_into_a_finite_turn_is_part_of_that_turn(tmp_path, monkeypatch, outcome, tick):
+    """MER-1529 review: a delivered steer carries its receiving claim's generation and settles
+    ``interrupted`` with it; it joined the finite turn, so it is not a separate interactive turn."""
+    runner, authority, ref, actor = await _local(tmp_path, monkeypatch)
+    _setting(tmp_path)
+    try:
+        target = _target(runner, authority, ref)
+        _attach(authority, ref, actor)
+        claimed, steer = _steer_into_claim(authority, ref, ('BOARD', True), outcome)
+        assert steer['generation'] == claimed['generation']
+        assert steer['outcome'] == ('steered' if outcome == 'completed' else 'interrupted')
+        seen = _turns(runner, authority, target)
+        await _producer(runner, authority, ref, tick)
+        await authority._drain(ref)
+        assert seen == [], f'a delivered steer became a separate interactive turn: {seen!r}'
+        assert len(_notes(authority, target)) == (0 if tick else 1)
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['completed', 'interrupted', 'failed'])
+async def test_a_steer_into_an_interactive_turn_after_a_finite_one_keeps_turns(tmp_path, monkeypatch, outcome):
+    """The receiving claim decides both ways: an interactive turn that ran after the finite one (with
+    a steer inside it) makes the next completion a turn."""
+    runner, authority, ref, actor = await _local(tmp_path, monkeypatch)
+    _setting(tmp_path)
+    try:
+        target = _target(runner, authority, ref)
+        _attach(authority, ref, actor)
+        _client(authority, ref, 'run-1', 'BOARD', finite=True)
+        _settle_claimed(authority, ref, 'interrupted')
+        _steer_into_claim(authority, ref, ('HELLO', False), outcome)
+        seen = _turns(runner, authority, target)
+        await _deliver(runner, authority, ref, _PROCESS)
+        await authority._drain(ref)
+        assert [text for text, _ in seen] == [_COMPLETION_TEXT]
+        assert _notes(authority, target) == []
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['completed', 'interrupted'])
+async def test_an_undelivered_steer_requeued_and_run_is_its_own_turn(tmp_path, monkeypatch, outcome):
+    runner, authority, ref, actor = await _local(tmp_path, monkeypatch)
+    _setting(tmp_path)
+    try:
+        target = _target(runner, authority, ref)
+        _attach(authority, ref, actor)
+        _claimed, steer = _steer_into_claim(authority, ref, ('BOARD', True), outcome, delivered=False)
+        assert steer['status'] == 'queued' and steer['generation'] is None
+        seen = _turns(runner, authority, target)
+        await _deliver(runner, authority, ref, _PROCESS)
+        await authority._drain(ref)
+        assert [text for text, _ in seen] == ['JOIN THIS TURN', _COMPLETION_TEXT]
+        assert _notes(authority, target) == []
+    finally:
+        authority.db.close()
