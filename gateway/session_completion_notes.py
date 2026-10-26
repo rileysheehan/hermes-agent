@@ -52,15 +52,21 @@ def noted_completion(row, authority=None):
     return authority is not None and _process_tick(row) and follows_finite_turn(authority, row)
 
 
-# The newest client input before a producer row that ran as a turn of its own: claimed (a generation)
-# and settled by its run. A row withdrawn while queued (``cancelled``, no generation) never ran, and a
-# ``steering`` row joined the turn it was handed to, which is itself the row that decides. Any other or
-# future outcome is skipped too, so an unrecognised row can only leave the earlier finite boundary in
-# force (a note), never clear it (MER-1528 review).
+# The newest client input before a producer row that ran as a turn of its own: claimed (a generation),
+# settled by its run, and the FIRST row of its generation. A claim takes a fresh per-session generation
+# (``claim_session_input``); a steer handed into a running claim takes that claim's generation and,
+# being queued behind it, a later seq, then settles ``steered`` or ``interrupted`` with it
+# (``settle_steer_transfers``), so the turn it joined is the row that decides (MER-1529 review). A row
+# withdrawn while queued (``cancelled``, no generation) never ran, and one handed back undelivered is
+# requeued with no generation and decides only once it is claimed for its own turn. Any other or future
+# outcome is skipped too, so an unrecognised row can only leave the earlier finite boundary in force
+# (a note), never clear it (MER-1528 review).
 _PRIOR_CLIENT_TURN = (
-    "SELECT payload_json FROM session_admissions WHERE target_session_id=? AND seq<? "
-    "AND substr(principal_id,1,11) != 'automation:' AND status='terminal' AND generation IS NOT NULL "
-    "AND outcome IN ('completed','interrupted','failed') ORDER BY seq DESC LIMIT 1")
+    "SELECT a.payload_json FROM session_admissions a WHERE a.target_session_id=? AND a.seq<? "
+    "AND substr(a.principal_id,1,11) != 'automation:' AND a.status='terminal' AND a.generation IS NOT NULL "
+    "AND a.outcome IN ('completed','interrupted','failed') AND NOT EXISTS (SELECT 1 FROM session_admissions b "
+    "WHERE b.target_session_id=a.target_session_id AND b.generation=a.generation AND b.seq<a.seq) "
+    "ORDER BY a.seq DESC LIMIT 1")
 
 
 def follows_finite_turn(authority, row):
