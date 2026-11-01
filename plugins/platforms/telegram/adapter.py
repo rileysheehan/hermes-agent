@@ -3717,17 +3717,28 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                    for chunk in chunks
-               ]
+            chunks = self._mdv2_reply_split(content)[1]
             return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
+
+    def _mdv2_reply_split(self, content: str) -> tuple[list[str], list[str]]:
+        """``(raw bodies, MarkdownV2 chunks)`` for a reply: one chunk, unchanged, when the formatted text fits;
+        otherwise the RAW text is split, each chunk formatted on its own with an escaped `` \\(i/n\\)`` marker, the
+        raw budget shrinking until every formatted chunk fits (``send_message_senders._mdv2_split``, shared with
+        the standalone sender). Splitting the formatted text instead can cut an escape pair or an entity
+        (``*bold*``, a link, inline code), and Telegram then refuses that chunk, which goes out as plain text. If
+        formatted chunks cannot fit, the text goes escaped and unformatted, never as a split of formatted text."""
+        formatted = self.format_message(content)
+        if utf16_len(formatted) <= self.MAX_MESSAGE_LENGTH:
+            return [content], [formatted]
+        from tools.send_message_senders import _mdv2_literal_split, _mdv2_split
+        split = _mdv2_split(content, self.format_message, self.MAX_MESSAGE_LENGTH)
+        if split is None:
+            logger.warning("[%s] could not fit the formatted reply chunks; sending the text escaped, unformatted", self.name)
+            split = _mdv2_literal_split(content, self.MAX_MESSAGE_LENGTH)
+        return split
 
     def _classify_send_exception(self, e: Exception, error_types: tuple) -> SendResult:
         """The failed ``SendResult`` for an exception escaping the chunk loop. ``retryable`` doubles as
@@ -3924,6 +3935,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             # re-sending is a visual no-op that still burns flood budget (200s+ penalties).
             if self._last_overflow_preview.get(_preview_key) == content:
                 return SendResult(success=True, message_id=message_id)
+        elif finalize and utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH:
+            # Escaping inflates: raw text that fits can format past the limit. Telegram refuses that edit as too
+            # long and _edit_markdown_or_plain would put the whole reply up as plain text, so split it instead.
+            return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
         elif not finalize:
             # Content shrank back under the cap — clear stale saturation state so dedup can't mask an edit.
             self._last_overflow_preview.pop(_preview_key, None)
@@ -4006,14 +4021,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _send_overflow_continuation(
         self, chat_id: str, chunk: str, reply_to_id: Optional[int], thread_kwargs: dict[str, Any],
-        thread_id: Optional[str], metadata: Optional[dict[str, Any]], finalize: bool):
+        thread_id: Optional[str], metadata: Optional[dict[str, Any]], finalize: bool, formatted: Optional[str] = None):
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
-        reply anchor once on 'reply message not found'. Returns the sent message or None."""
+        reply anchor once on 'reply message not found'. ``formatted``: the chunk's MarkdownV2 already sized by
+        ``_mdv2_reply_split`` (else ``chunk`` is formatted here). Returns the sent message or None."""
         base = {**self._link_preview_kwargs(metadata, chunk), **self._notification_kwargs(metadata)}
         for use_markdown in (True, False) if finalize else (False,):
             try:
                 if use_markdown:
-                    text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
+                    text = formatted if formatted is not None else _separate_chunk_indicator_from_fence(self.format_message(chunk))
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
@@ -4039,6 +4055,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                             "[%s] Overflow continuation no-reply retry failed: %s", self.name, _redact_telegram_error_text(_retry_err))
                         return None
                 if use_markdown:
+                    logger.warning(
+                        "[%s] Overflow continuation: MarkdownV2 send failed, falling back to plain text: %s",
+                        self.name, _redact_telegram_error_text(send_err))
                     continue  # try plain text on next loop iteration
                 logger.warning("[%s] Overflow continuation send failed: %s", self.name, _redact_telegram_error_text(send_err))
                 return None
@@ -4048,15 +4067,25 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self, chat_id: str, message_id: str, content: str, *, finalize: bool, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Split an oversized edit across the existing message + continuations: edit ``message_id`` with
         chunk 1, send the rest as replies to the previous chunk, return ``message_id=<last-chunk-id>`` so
-        the consumer keeps editing the newest message. ``success=False`` only if the first-chunk edit fails."""
-        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+        the consumer keeps editing the newest message. ``success=False`` only if the first-chunk edit fails.
+        On finalize the chunks are formatted the way ``send()`` formats them (``_mdv2_reply_split``): the raw text
+        is split so each chunk's own MarkdownV2 fits, instead of a 4096-unit raw split whose formatting can run past
+        the limit and leave that chunk plain."""
+        formatted: list[str] = []  # finalize only: the MarkdownV2 of each chunk, sized to fit
+        if finalize:
+            bodies, formatted = self._mdv2_reply_split(content)
+            n = len(bodies)
+            # Raw chunks keep truncate_message's raw " (i/n)" marker: the plain fallback and delivered_prefix use them.
+            chunks = [f"{body} ({i}/{n})" for i, body in enumerate(bodies, 1)] if n > 1 else [content]
+        else:
+            chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
         if len(chunks) <= 1:
             chunks = [content]  # defensive: a single chunk just edits normally
         first_chunk = chunks[0]
         try:
             if finalize:
                 await self._edit_markdown_or_plain(
-                    chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
+                    chat_id, message_id, formatted[0], _strip_mdv2(first_chunk),
                     "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
             else:
                 await self._edit_text(chat_id, message_id, first_chunk)
@@ -4069,10 +4098,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         delivered_chunks = [first_chunk]
         prev_id = message_id
         thread_id = self._metadata_thread_id(metadata)
-        for chunk in chunks[1:]:
+        for k, chunk in enumerate(chunks[1:], 1):
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id)
-            sent_msg = await self._send_overflow_continuation(chat_id, chunk, reply_to_id, thread_kwargs, thread_id, metadata, finalize)
+            sent_msg = await self._send_overflow_continuation(
+                chat_id, chunk, reply_to_id, thread_kwargs, thread_id, metadata, finalize,
+                formatted=formatted[k] if formatted else None)
             if sent_msg is None:
                 # Partial delivery: do NOT report success — the consumer would treat it as final delivery.
                 logger.warning("[%s] Overflow split: stopped at %d/%d chunks delivered", self.name, 1 + len(continuation_ids), len(chunks))
