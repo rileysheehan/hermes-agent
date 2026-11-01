@@ -58,7 +58,7 @@ class TestSendWithReplyToMode:
         adapter = adapter_factory(reply_to_mode="off")
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1", "chunk2", "chunk3"]
+        adapter._mdv2_reply_split = lambda content: (["c1", "c2", "c3"], ["chunk1", "chunk2", "chunk3"])
 
         await adapter.send("12345", "test content", reply_to="999")
 
@@ -70,7 +70,7 @@ class TestSendWithReplyToMode:
         adapter = adapter_factory(reply_to_mode="first")
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1", "chunk2", "chunk3"]
+        adapter._mdv2_reply_split = lambda content: (["c1", "c2", "c3"], ["chunk1", "chunk2", "chunk3"])
 
         await adapter.send("12345", "test content", reply_to="999")
 
@@ -160,7 +160,7 @@ class TestSyntheticReplyAnchor:
         adapter = adapter_factory(reply_to_mode="all")
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1", "chunk2"]
+        adapter._mdv2_reply_split = lambda content: (["c1", "c2"], ["chunk1", "chunk2"])
 
         result = await adapter.send("12345", "test content", reply_to=self.WAKE_ID)
 
@@ -174,7 +174,7 @@ class TestSyntheticReplyAnchor:
         adapter = adapter_factory()
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1"]
+        adapter._mdv2_reply_split = lambda content: (["c1"], ["chunk1"])
         metadata = {"thread_id": "42", "telegram_dm_topic_reply_fallback": True,
                     "telegram_reply_to_message_id": "12345"}
 
@@ -235,7 +235,7 @@ class TestDMTopicFallbackReplyToMode:
         adapter = adapter_factory(reply_to_mode="off")
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1"]
+        adapter._mdv2_reply_split = lambda content: (["c1"], ["chunk1"])
 
         await adapter.send("12345", "test content", metadata=self.DM_TOPIC_METADATA)
 
@@ -331,7 +331,7 @@ class TestDMTopicSyntheticSendRouting:
         adapter = adapter_factory()
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1"]
+        adapter._mdv2_reply_split = lambda content: (["c1"], ["chunk1"])
         metadata = {
             "thread_id": "42",
             "telegram_dm_topic_reply_fallback": True,
