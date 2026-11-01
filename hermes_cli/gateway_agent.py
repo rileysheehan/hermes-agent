@@ -1003,6 +1003,11 @@ class GatewayAgent:
         mark_dirty()  # a terminal/process call may have started or stopped a background process
         if name == "todo":
             self._todo_from_result(result)
+        # The CLI registers tool_complete_callback only when it shows edit previews (display.inline_diffs),
+        # and -Q's _configure_quiet_agent clears it so stdout carries only the final response. With no
+        # callback, the gateway's rendered diff is not ours to print: on -Q stdout it became the reply.
+        if self.tool_complete_callback is None:
+            return
         diff = payload.get("inline_diff")
         if isinstance(diff, str) and diff:
             from cli import _cprint
@@ -1010,9 +1015,9 @@ class GatewayAgent:
             emit = diff_printer(_cprint)
             for line in diff.rstrip("\n").splitlines():
                 emit(line)
-            if name == "delegate_task" and self.tool_complete_callback is not None:
+            if name == "delegate_task":
                 self.tool_complete_callback(call_id, name, args, result)
-        elif self.tool_complete_callback is not None:
+        else:
             self.tool_complete_callback(call_id, name, args, result)
 
     def _todo_from_result(self, result):

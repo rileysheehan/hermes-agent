@@ -144,6 +144,117 @@ def _strip_mdv2_safe(text):
         return text
 
 
+_TELEGRAM_TEXT_LIMIT = 4096  # UTF-16 units per message
+
+
+def _mdv2_formatter():
+    """The adapter's Markdown -> MarkdownV2 converter, or None when the adapter is unavailable."""
+    try:
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+    except ImportError:
+        return None
+    return TelegramAdapter.__new__(TelegramAdapter).format_message
+
+
+def _bold_delimiters(raw):
+    """``**`` delimiters in raw Markdown outside fenced and inline code (what ``format_message`` pairs)."""
+    raw = re.sub(r"```[\s\S]*?(?:```|\Z)", "", raw)
+    return re.sub(r"`[^`\n]*`", "", raw).count("**")
+
+
+# A chunk opening with block syntax (fence, quote, header, list, table) is not reopened with "**": "**>" is an
+# expandable quote, "**#" no longer a header.
+_BLOCK_START_RE = re.compile(r"\s*(?:[`>#|*+-]|\d+[.)])")
+
+
+def _rebalance_bold(bodies):
+    """A ``**bold**`` span the raw split cut in two is closed at the end of its chunk and reopened at the start
+    of the next, so both halves render bold instead of showing literal asterisks. Left alone next to a code
+    fence the splitter synthesized (the delimiter would break the fence line); validity never depends on this,
+    since every chunk is formatted on its own."""
+    bodies = list(bodies)
+    for i in range(len(bodies) - 1):
+        if (_bold_delimiters(bodies[i]) % 2 and not bodies[i].endswith("```")
+                and not _BLOCK_START_RE.match(bodies[i + 1])):
+            bodies[i] += "**"
+            bodies[i + 1] = "**" + bodies[i + 1]
+    return bodies
+
+
+def _split_raw(message, budget):
+    """``truncate_message`` pieces of the RAW text with its `` (i/n)`` markers taken off (they are re-added escaped)."""
+    from gateway.platforms.base import BasePlatformAdapter, utf16_len
+    pieces = BasePlatformAdapter.truncate_message(message, budget, len_fn=utf16_len)
+    n = len(pieces)
+    return [p.removesuffix(f" ({i}/{n})") for i, p in enumerate(pieces, 1)] if n > 1 else pieces
+
+
+def _with_marker(text, i, n):
+    """``text`` with its escaped `` \\(i/n\\)`` marker (on its own line after a closing fence); none for one chunk."""
+    if n == 1:
+        return text
+    text = text.rstrip()
+    return f"{text}{chr(10) if text.endswith('```') else ' '}\\({i}/{n}\\)"
+
+
+def _mdv2_chunks(message, fmt, limit=_TELEGRAM_TEXT_LIMIT):
+    """Split RAW Markdown, then format each chunk on its own, then add an escaped `` \\(i/n\\)`` marker.
+
+    Splitting the formatted text instead (as the gateway adapter's ``send()`` does) can cut an escape pair
+    (``\\`` | ``.``) or an entity (``*bold*``, a link) and leave a chunk Telegram refuses; a chunk formatted on its
+    own is exactly as valid as a short message. Escaping inflates the text (a raw message that fits can format past
+    the limit), so the raw budget shrinks, one piece or many, until every formatted chunk fits. None when it
+    cannot converge: the caller then sends the text escaped (``_mdv2_literal_chunks``), never a formatted split."""
+    from gateway.platforms.base import utf16_len
+    budget = limit
+    for _ in range(16):
+        bodies = _split_raw(message, budget)
+        n = len(bodies)
+        out = [_with_marker(fmt(body), i, n) for i, body in enumerate(_rebalance_bold(bodies), 1)]
+        longest = max(utf16_len(c) for c in out)
+        if longest <= limit:
+            return out
+        if budget <= 64:
+            break
+        budget = max(64, min(budget - 1, budget * limit // longest - 32))
+    return None
+
+
+_MDV2_LITERAL_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
+
+
+def _mdv2_literal_chunks(message, limit=_TELEGRAM_TEXT_LIMIT):
+    """The text split as raw pieces and sent with every reserved character escaped: no formatting, but every chunk
+    is valid MarkdownV2 and fits (an escape at most doubles a piece of (limit - 16) // 2 units)."""
+    bodies = _split_raw(message, (limit - 16) // 2)
+    n = len(bodies)
+    return [_with_marker(_MDV2_LITERAL_RE.sub(r"\\\1", body), i, n) for i, body in enumerate(bodies, 1)]
+
+
+def _telegram_chunks(message, formatted, parse_mode, has_html):
+    """Telegram-sized text chunks (UTF-16 units) for ``_send_telegram``.
+
+    MarkdownV2 (the default): a message whose formatted text fits is one chunk, unchanged. A longer one is split
+    as Markdown and each chunk formatted on its own (``_mdv2_chunks``), so a split can never leave a chunk
+    Telegram refuses: before this every chunk got a raw `` (1/2)`` marker after formatting (``(`` is reserved) and
+    a split could cut an escape pair or entity, so chunks went out as plain text. If that cannot fit (or there is
+    no formatter) the text goes escaped instead, never as a split of formatted text. HTML: split as before."""
+    from gateway.platforms.base import BasePlatformAdapter, utf16_len
+    if not formatted.strip():
+        return []
+    if utf16_len(formatted) <= _TELEGRAM_TEXT_LIMIT:
+        return [formatted]
+    if has_html or parse_mode is None:
+        return BasePlatformAdapter.truncate_message(formatted, _TELEGRAM_TEXT_LIMIT, len_fn=utf16_len)
+    fmt = _mdv2_formatter()
+    chunks = _mdv2_chunks(message, fmt) if fmt else None
+    if chunks is None:
+        logger.warning("_send_telegram could not fit the formatted chunks; sending the text escaped, unformatted")
+        chunks = _mdv2_literal_chunks(message)
+    return chunks
+
+
+
 def _adapter_media_method(ext, voice, force_document=False):
     """``(adapter method, kind)``: document when forced, else image / video / voice by
     extension (``voice`` already folds in the caller's audio rule)."""
@@ -165,10 +276,13 @@ async def _telegram_send_media(bot, chat_id, f, ext, is_voice, force_document, *
     return await getattr(bot, f"send_{kind}")(chat_id=chat_id, **{kind: f}, **kwargs)
 
 
-async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs):
+async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs, part=(1, 1),
+                                    fallbacks=None):
     """One text chunk with adapter-matching fallbacks: thread-not-found -> retry without
     ``message_thread_id`` (dropped from ``text_kwargs`` for later chunks too); parse failure
-    -> plain text."""
+    -> plain text. ``part`` is (index, total) of this chunk, named in the fallback warning so a
+    log reader counts refused chunks, not messages; a plain-text fallback appends ``part`` to
+    ``fallbacks`` when given."""
     async def send(text, mode):
         return await _send_telegram_message_with_retry(bot, chat_id=chat_id, text=text, parse_mode=mode, **text_kwargs)
     try:
@@ -182,8 +296,10 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
             return await send(chunk, parse_mode)
         err_text = str(md_error).lower()
         if "parse" in err_text or "markdown" in err_text or "html" in err_text:
-            logger.warning("Parse mode %s failed in _send_telegram, falling back to plain text: %s",
-                           parse_mode, _sanitize_error_text(md_error))
+            logger.warning("Parse mode %s failed in _send_telegram (chunk %d/%d), falling back to plain text: %s",
+                           parse_mode, part[0], part[1], _sanitize_error_text(md_error))
+            if fallbacks is not None:
+                fallbacks.append(part)
             return await send(chunk if has_html else _strip_mdv2_safe(chunk), None)
         raise
 
@@ -319,7 +435,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
-        from gateway.platforms.base import BasePlatformAdapter, utf16_len
+        from gateway.platforms.base import utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
@@ -341,14 +457,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         _cap, _ = _media_caption_split(message, media_files, max_caption_len=_TELEGRAM_CAPTION_LIMIT)
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
-        # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
+        # Chunk in UTF-16 units, measured on the formatted text: escaping can push a raw-<4096 message over.
         reply_kwargs = _telegram_reply_kwargs(reply_to)  # consumed by the first message actually sent
-        for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
+        chunks = _telegram_chunks(message, formatted, send_parse_mode, _has_html)
+        fallbacks, message_ids = [], []
+        for i, chunk in enumerate(chunks, 1):
             kw = {**text_kwargs, **reply_kwargs} if reply_kwargs else text_kwargs
-            last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, kw)
+            last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, kw,
+                                                       part=(i, len(chunks)), fallbacks=fallbacks)
+            message_ids.append(getattr(last_msg, "message_id", None))
             if kw is not text_kwargs and "message_thread_id" not in kw:
                 text_kwargs.pop("message_thread_id", None)  # thread-not-found fallback carries to later chunks
             reply_kwargs = {}
+        if len(chunks) > 1 and not fallbacks and all(mid is not None for mid in message_ids):
+            # Written only after Telegram accepted every chunk in its own parse mode: the success record a log
+            # reader can count, never written for a refused (plain-text fallback) or failed send.
+            logger.info("_send_telegram delivered all %d chunks in parse mode %s (message ids %s)",
+                        len(chunks), send_parse_mode, ",".join(map(str, message_ids)))
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
