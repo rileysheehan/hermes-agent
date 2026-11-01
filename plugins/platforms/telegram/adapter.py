@@ -199,6 +199,7 @@ from plugins.platforms.telegram import telegram_flood_window as _flood_window
 from plugins.platforms.telegram.telegram_media_fetch import (
     cache_replied_media, fetch_telegram_file, local_root, merged_typed_text, record_typed_text)
 from plugins.platforms.telegram.link_previews import link_preview_choice, parse_skip_hosts
+from plugins.platforms.telegram.mdv2_split import reply_split as mdv2_reply_split
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, tap_matches_prompt
@@ -3437,7 +3438,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     await self._retrigger_typing(chat_id, metadata)
                 return rich_result
             # Entities cut by a split are closed and reopened; the (N/M) markers come back MarkdownV2-escaped.
-            chunks = split_formatted_mdv2(self.format_message(content), self.MAX_MESSAGE_LENGTH, self.truncate_message, utf16_len)
+            # Split as RAW Markdown, each chunk formatted on its own: a formatted split can still cut a fence or an
+            # escape pair on mixed Markdown (Mercury MER-1752).
+            chunks = self._mdv2_reply_split(content)[1]
             if as_file := await hand_off_split(self, chat_id, content, len(chunks), reply_to=reply_to, metadata=metadata):
                 return as_file  # a refused rich send re-split past the cap: one file instead (#152012)
             return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
@@ -3609,6 +3612,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             # re-sending is a visual no-op that still burns flood budget (200s+ penalties).
             if self._last_overflow_preview.get(_preview_key) == content:
                 return SendResult(success=True, message_id=message_id)
+        elif finalize and utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH:
+            # Escaping inflates: raw text that fits can format past the limit. Telegram refuses that edit as too
+            # long and _edit_markdown_or_plain would put the whole reply up as plain text, so split it instead.
+            return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
         elif not finalize:
             # Content shrank back under the cap — clear stale saturation state so dedup can't mask an edit.
             self._last_overflow_preview.pop(_preview_key, None)
@@ -3688,6 +3695,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """
         return self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
 
+    def _mdv2_reply_split(self, content: str) -> tuple[list[str], list[str]]:
+        """``(raw bodies, MarkdownV2 chunks)`` for a reply (``mdv2_split.reply_split``)."""
+        return mdv2_reply_split(self, content)
+
     async def _send_overflow_continuation(
         self, chat_id: str, chunk: str, reply_to_id: Optional[int], thread_kwargs: dict[str, Any],
         thread_id: Optional[str], metadata: Optional[dict[str, Any]], finalize: bool):
@@ -3726,6 +3737,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 if getattr(send_err, "retry_after", None) is not None or "retry after" in str(send_err).lower():
                     return _flood_cap_result(float(getattr(send_err, "retry_after", None) or 30.0))  # no plain retry into the penalty (#76494)
                 if use_markdown:
+                    logger.warning(
+                        "[%s] Overflow continuation: MarkdownV2 send failed, falling back to plain text: %s",
+                        self.name, _redact_telegram_error_text(send_err))
                     continue  # try plain text on next loop iteration
                 logger.warning("[%s] Overflow continuation send failed: %s", self.name, _redact_telegram_error_text(send_err))
                 return None
