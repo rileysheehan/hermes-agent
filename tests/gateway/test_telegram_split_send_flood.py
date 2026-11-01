@@ -55,7 +55,7 @@ async def test_split_send_resumes_from_undelivered_tail_without_resending_head(m
 
     monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", _penalty_elapses)
     content = _three_chunk_text()
-    expected = adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH)
+    expected = adapter._mdv2_reply_split(content)[1]
     assert len(expected) >= 3
 
     result = await adapter._send_with_retry(chat_id="4242", content=content)
@@ -81,7 +81,7 @@ async def test_over_cap_flood_returns_partial_overflow_and_arms_cooldown(monkeyp
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
 
     content = _three_chunk_text()
-    total = len(adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
+    total = len(adapter._mdv2_reply_split(content)[1])
     result = await adapter._send_with_retry(chat_id="4242", content=content)
 
     assert result.success is False and result.error == "flood_control:120.0"
