@@ -197,14 +197,16 @@ def _with_marker(text, i, n):
     return f"{text}{chr(10) if text.endswith('```') else ' '}\\({i}/{n}\\)"
 
 
-def _mdv2_chunks(message, fmt, limit=_TELEGRAM_TEXT_LIMIT):
-    """Split RAW Markdown, then format each chunk on its own, then add an escaped `` \\(i/n\\)`` marker.
+def _mdv2_split(message, fmt, limit=_TELEGRAM_TEXT_LIMIT):
+    """``(raw bodies, formatted chunks)``: split RAW Markdown, then format each chunk on its own, then add an
+    escaped `` \\(i/n\\)`` marker. The raw bodies (markers off, before the bold rebalance) are what each formatted
+    chunk shows, for a caller that tracks the visible text or needs a plain fallback per chunk.
 
-    Splitting the formatted text instead (as the gateway adapter's ``send()`` does) can cut an escape pair
-    (``\\`` | ``.``) or an entity (``*bold*``, a link) and leave a chunk Telegram refuses; a chunk formatted on its
-    own is exactly as valid as a short message. Escaping inflates the text (a raw message that fits can format past
-    the limit), so the raw budget shrinks, one piece or many, until every formatted chunk fits. None when it
-    cannot converge: the caller then sends the text escaped (``_mdv2_literal_chunks``), never a formatted split."""
+    Splitting the formatted text instead can cut an escape pair (``\\`` | ``.``) or an entity (``*bold*``, a link)
+    and leave a chunk Telegram refuses; a chunk formatted on its own is exactly as valid as a short message.
+    Escaping inflates the text (a raw message that fits can format past the limit), so the raw budget shrinks, one
+    piece or many, until every formatted chunk fits. None when it cannot converge: the caller then sends the text
+    escaped (``_mdv2_literal_split``), never a formatted split. Shared with the gateway adapter's ``send()``."""
     from gateway.platforms.base import utf16_len
     budget = limit
     for _ in range(16):
@@ -213,22 +215,34 @@ def _mdv2_chunks(message, fmt, limit=_TELEGRAM_TEXT_LIMIT):
         out = [_with_marker(fmt(body), i, n) for i, body in enumerate(_rebalance_bold(bodies), 1)]
         longest = max(utf16_len(c) for c in out)
         if longest <= limit:
-            return out
+            return bodies, out
         if budget <= 64:
             break
         budget = max(64, min(budget - 1, budget * limit // longest - 32))
     return None
 
 
+def _mdv2_chunks(message, fmt, limit=_TELEGRAM_TEXT_LIMIT):
+    """The formatted chunks of :func:`_mdv2_split`, or None when it cannot converge."""
+    split = _mdv2_split(message, fmt, limit)
+    return None if split is None else split[1]
+
+
 _MDV2_LITERAL_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
 
 
-def _mdv2_literal_chunks(message, limit=_TELEGRAM_TEXT_LIMIT):
-    """The text split as raw pieces and sent with every reserved character escaped: no formatting, but every chunk
-    is valid MarkdownV2 and fits (an escape at most doubles a piece of (limit - 16) // 2 units)."""
+def _mdv2_literal_split(message, limit=_TELEGRAM_TEXT_LIMIT):
+    """``(raw bodies, chunks)``: the text split as raw pieces and sent with every reserved character escaped: no
+    formatting, but every chunk is valid MarkdownV2 and fits (an escape at most doubles a piece of
+    (limit - 16) // 2 units)."""
     bodies = _split_raw(message, (limit - 16) // 2)
     n = len(bodies)
-    return [_with_marker(_MDV2_LITERAL_RE.sub(r"\\\1", body), i, n) for i, body in enumerate(bodies, 1)]
+    return bodies, [_with_marker(_MDV2_LITERAL_RE.sub(r"\\\1", body), i, n) for i, body in enumerate(bodies, 1)]
+
+
+def _mdv2_literal_chunks(message, limit=_TELEGRAM_TEXT_LIMIT):
+    """The chunks of :func:`_mdv2_literal_split`."""
+    return _mdv2_literal_split(message, limit)[1]
 
 
 def _telegram_chunks(message, formatted, parse_mode, has_html):
