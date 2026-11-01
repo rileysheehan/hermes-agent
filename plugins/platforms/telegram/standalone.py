@@ -185,11 +185,14 @@ def _is_telegram_parse_error(error) -> bool:
     return is_entity_parse_error(error)
 
 
-async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs, outcome=None):
+async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs, outcome=None,
+                                    part=(1, 1), fallbacks=None):
     """One text chunk with adapter-matching fallbacks: thread-not-found -> retry without
     ``message_thread_id`` (dropped from ``text_kwargs`` for later chunks too); parse failure
     -> plain text. A rejected HTML chunk (an unsupported tag beside supported ones) first
-    retries as MarkdownV2, so its Markdown still renders. ``outcome`` sees every attempt."""
+    retries as MarkdownV2, so its Markdown still renders. ``outcome`` sees every attempt.
+    ``part`` is (index, total) of this chunk, named in the fallback warning so a log reader counts refused
+    chunks, not messages; a fallback appends ``part`` to ``fallbacks`` when given."""
     async def send(text, mode):
         return await _send_telegram_message_with_retry(
             bot, chat_id=chat_id, text=text, parse_mode=mode, outcome=outcome, **text_kwargs)
@@ -204,8 +207,10 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
             return await send(chunk, parse_mode)
         if not _is_telegram_parse_error(md_error):
             raise
-        logger.warning("Parse mode %s failed in _send_telegram, falling back: %s",
-                       parse_mode, _sanitize_error_text(md_error))
+        logger.warning("Parse mode %s failed in _send_telegram (chunk %d/%d), falling back to plain text: %s",
+                       parse_mode, part[0], part[1], _sanitize_error_text(md_error))
+        if fallbacks is not None:
+            fallbacks.append(part)
         if has_html and (mdv2 := _telegram_mdv2(chunk, max_units=4096)) is not None:
             try:
                 return await send(mdv2, "MarkdownV2")
@@ -442,7 +447,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token, extra)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
-        from gateway.platforms.base import BasePlatformAdapter, utf16_len
+        from gateway.platforms.base import utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
@@ -469,24 +474,27 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         _cap, _ = _media_caption_split(message, media_files)
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
-        # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        if not formatted.strip():
-            chunks = []
-        elif _has_html:
-            chunks = BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len)
-        else:
-            # Same split as the live adapter: entities cut by a split are closed and reopened, and the
-            # " (1/2)" markers come back MarkdownV2-escaped (#74004).
-            from plugins.platforms.telegram.telegram_chunking import split_formatted_mdv2
-            chunks = split_formatted_mdv2(formatted, 4096, BasePlatformAdapter.truncate_message, utf16_len)
-        for chunk in chunks:
+        # Chunk in UTF-16 units, measured on the formatted text: escaping can push a raw-<4096 message over. A
+        # long MarkdownV2 message is split as RAW Markdown and each chunk formatted on its own (mdv2_split), so
+        # no split leaves a chunk Telegram refuses.
+        from plugins.platforms.telegram.mdv2_split import telegram_chunks
+        chunks = telegram_chunks(message if _tg_caption is None else "", formatted, send_parse_mode, _has_html)
+        fallbacks, message_ids = [], []
+        for i, chunk in enumerate(chunks, 1):
             kw = {**text_kwargs, **reply_kwargs} if reply_kwargs else text_kwargs
             last_msg = await _telegram_send_text_chunk(
-                bot, int_chat_id, chunk, send_parse_mode, _has_html, kw, outcome=outcome)
+                bot, int_chat_id, chunk, send_parse_mode, _has_html, kw, outcome=outcome,
+                part=(i, len(chunks)), fallbacks=fallbacks)
+            message_ids.append(getattr(last_msg, "message_id", None))
             if kw is not text_kwargs and "message_thread_id" not in kw:
                 text_kwargs.pop("message_thread_id", None)  # thread-not-found fallback carries to later chunks
             reply_kwargs = {}
             outcome.landed(getattr(last_msg, "message_id", None))
+        if len(chunks) > 1 and not fallbacks and all(mid is not None for mid in message_ids):
+            # Written only after Telegram accepted every chunk in its own parse mode: the success record a log
+            # reader can count, never written for a refused (plain-text fallback) or failed send.
+            logger.info("_send_telegram delivered all %d chunks in parse mode %s (message ids %s)",
+                        len(chunks), send_parse_mode, ",".join(map(str, message_ids)))
         # A reply still owed goes on the first upload, so an album (which cannot carry it) goes file by file.
         if not reply_kwargs and (album := _telegram_album_paths(media_files, force_document, _tg_caption)):
             result = await send_album_standalone(bot, extra or {}, chat_id, album, thread_id=thread_id, notify=notify)
