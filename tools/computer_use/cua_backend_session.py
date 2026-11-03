@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -165,6 +166,32 @@ def _is_ended_session_result(result: Any) -> bool:
     message = _logical_error_text(result).lower()
     return ("session" in message and "start_session" in message
             and ("has ended" in message or "session ended" in message))
+
+
+# cua-driver names the ended session in its rejection: "session '<id>' has ended; tool call '<tool>' was rejected.
+# Call start_session with this id to revive it ...". Older wording ("this session has ended") names none.
+_ENDED_SESSION_ID_RE = re.compile(r"session '([A-Za-z0-9][A-Za-z0-9._:-]{0,127})' has ended")
+
+
+def _ended_session_id(result: dict[str, Any]) -> Optional[str]:
+    """The session id an ended-session rejection names, or None."""
+    match = _ENDED_SESSION_ID_RE.search(_logical_error_text(result))
+    return match.group(1) if match else None
+
+
+# The MCP SDK's own synthesized error for a dead stdio peer (mcp_types.CONNECTION_CLOSED): every in-flight and later
+# request on the closed transport raises MCPError(-32000, "Connection closed").
+_MCP_CONNECTION_CLOSED = -32000
+
+
+def _is_mcp_connection_closed(exc: BaseException) -> bool:
+    """Structural match on ``exc.error`` (``MCPError``/``McpError`` across SDK generations), never ``isinstance``.
+    Both the code and the SDK's exact message must match: -32000 alone is also JSON-RPC's generic server-error code,
+    which a LIVE server may return for a logical failure."""
+    error = getattr(exc, "error", None)
+    message = getattr(error, "message", None)
+    return (getattr(error, "code", None) == _MCP_CONNECTION_CLOSED and isinstance(message, str)
+            and message.strip().lower() == "connection closed")
 
 
 class _CuaDriverSession:
@@ -390,7 +417,10 @@ class _CuaDriverSession:
         name, module = exc.__class__.__name__, getattr(exc.__class__, "__module__", "")
         return (name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
                 or (module.startswith("anyio") and "Resource" in name)
-                or isinstance(exc, (BrokenPipeError, EOFError)))
+                or isinstance(exc, (BrokenPipeError, EOFError))
+                # A dead `cua-driver mcp` child surfaces as the SDK's MCPError "Connection closed", not an anyio
+                # stream error; without this the cached session never reconnects.
+                or _is_mcp_connection_closed(exc))
 
     @staticmethod
     def _is_transient_daemon_error(exc: Exception) -> bool:
@@ -402,9 +432,10 @@ class _CuaDriverSession:
                                                 "daemon transport error", "daemon proxy"))
 
     # ── Recovery ─────────────────────────────────────────────────────
-    def _redeclare_session(self, timeout: float, failure_msg: str) -> bool:
-        """start_session with the declared id; log *failure_msg* and return False on rejection."""
-        session_id = self._declared_session_id
+    def _redeclare_session(self, timeout: float, failure_msg: str, session_id: Optional[str] = None) -> bool:
+        """start_session with *session_id* (default: the declared id); log *failure_msg* and return False on
+        rejection."""
+        session_id = session_id or self._declared_session_id
         result = self._bridge.run(self._call_tool_async("start_session", {"session": session_id}), timeout=timeout)
         if result.get("isError") is True:
             logger.warning(failure_msg, session_id, _logical_error_text(result))
@@ -509,13 +540,54 @@ class _CuaDriverSession:
         if name == "start_session" and ok and isinstance(declared_id, str) and declared_id:
             self._declared_session_id = declared_id
         if _is_ended_session_result(result):
-            # Revive the stable session and replay the rejected call once; a 2nd rejection surfaces as-is.
             # Never re-runs lifecycle calls -> an end_session result is final.
-            session_id = self._declared_session_id
-            if session_id and name not in self._LIFECYCLE_CALLS:
-                logger.warning("cua-driver session %s ended during %s; reviving and retrying once", session_id, name)
-                if self._redeclare_session(timeout, "cua-driver session %s could not be revived: %s"):
-                    result = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            if name not in self._LIFECYCLE_CALLS:
+                result = self._revive_ended_session(name, args, timeout, result)
         elif name == "end_session" and ok and declared_id == self._declared_session_id:
             self._declared_session_id = None
         return result
+
+    def _revive_ended_session(self, name: str, args: dict[str, Any], timeout: float,
+                              result: dict[str, Any]) -> dict[str, Any]:
+        """Revive the session an ended-session rejection names, then replay the rejected call. The driver refused
+        the call before running it, so a replay never doubles an action: every replay here follows a rejection.
+
+        A call that carries no ``session`` label (``bring_to_front``'s strict schema has none) runs in the
+        transport's implicit ``mcp-<pid>-...`` session, which the driver reclaims on its idle TTL. Re-declaring our
+        own public label never revives that one, so revive the id the driver names; if the call is still rejected,
+        a fresh transport brings a fresh implicit session (the public label is restored by ``_recreate_session``).
+        """
+        declared, named = self._declared_session_id, _ended_session_id(result)
+        session_id = named or declared
+        if not session_id:
+            return result
+        if session_id == declared:
+            # Revive the stable session and replay the rejected call once; a 2nd rejection surfaces as-is.
+            logger.warning("cua-driver session %s ended during %s; reviving and retrying once", session_id, name)
+            if self._redeclare_session(timeout, "cua-driver session %s could not be revived: %s"):
+                result = self._replay_rejected_call(name, args, timeout)
+            return result
+        logger.warning("cua-driver session %s ended during %s; reviving the named session and retrying once",
+                       session_id, name)
+        if self._redeclare_session(timeout, "cua-driver session %s could not be revived: %s", session_id=session_id):
+            result = self._replay_rejected_call(name, args, timeout)
+        if not _is_ended_session_result(result) or "session" in args:
+            return result  # a 2nd rejection of an explicitly labelled call surfaces as-is
+        self._recreate_session(name, timeout, "cua-driver implicit session still ended on %s; recreating the "
+                                              "transport and retrying once")
+        return self._replay_rejected_call(name, args, timeout)
+
+    def _replay_rejected_call(self, name: str, args: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """Re-issue a call the driver REJECTED. The replay itself is a fresh attempt: a timeout or a closed
+        transport during it leaves its outcome unknown, so it fails closed exactly like a first attempt."""
+        try:
+            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+        except concurrent.futures.TimeoutError as e:
+            self._timeout_suspect = True
+            logger.warning("cua-driver MCP timed out replaying %s; marking session suspect", name)
+            return _outcome_unknown(name, e, "timeout_outcome_unknown")
+        except Exception as e:
+            if not (self._is_closed_session_error(e) or self._is_transient_daemon_error(e)):
+                raise
+            self._notify_transport_reset()
+            return _outcome_unknown(name, e, "transport_outcome_unknown")
