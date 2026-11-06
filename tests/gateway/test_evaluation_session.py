@@ -9,7 +9,7 @@ from gateway import run
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionStore
 from gateway.session_authority import initialize_session_authority
-from gateway.session_contract import Principal, Submission
+from gateway.session_contract import SessionActor, Submission
 from gateway.session_local import create_local_session, local_session_info
 from gateway.session_evaluation import guard_submit, guard_method
 from hermes_state_runtime import RuntimeStoreError
@@ -31,7 +31,7 @@ async def test_real_creation_precedes_prewarm_and_cold_resume_preserves_lock(tmp
                              _cached_agent_for=lambda *a, **k: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(Platform.LOCAL)
     owner = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
-    actor = Principal('human', str(tmp_path), frozenset({'session:create','session:read','session:submit','session:control'}), 'wire')
+    actor = SessionActor('human', str(tmp_path), frozenset({'session:create','session:read','session:submit','session:control'}), 'wire')
     params = {'request_id': 'evaluation', 'source': 'oneshot', 'model': 'fixture',
               'cwd': str(tmp_path), 'evaluation_isolation': 1}
     ref = create_local_session(owner, actor, params)
@@ -78,7 +78,7 @@ async def test_wrong_provider_refuses_before_session_commit_or_enrollment(tmp_pa
                              _cached_agent_for=lambda *a, **k: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(Platform.LOCAL)
     owner = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
-    actor = Principal('human', str(tmp_path), frozenset({'session:create','session:read'}), 'wire')
+    actor = SessionActor('human', str(tmp_path), frozenset({'session:create','session:read'}), 'wire')
     def census():
         with owner.db._read_ctx() as c:
             return [tuple(row) for row in c.execute('SELECT id FROM sessions ORDER BY id')]

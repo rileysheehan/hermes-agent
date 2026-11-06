@@ -83,19 +83,17 @@ def test_drain_flushes_a_deferred_review_before_waiting(monkeypatch):
 # ── opt-in one-shot learning ──────────────────────────────────────────────────
 
 
-def test_oneshot_keeps_skill_manage_only_when_learning_is_opted_in(oneshot, monkeypatch):
-    names = lambda: {t["function"]["name"] for t in oneshot_footprint.prune_oneshot_tools(_tools("skill_manage", "terminal"))}
+def test_oneshot_learning_switches_only_the_skills_guidance(oneshot, monkeypatch):
+    # Since v0.23.0 upstream keeps skill_manage offered to every one-shot; the opt-in only changes the coaching.
     _cfg(monkeypatch)
-    assert names() == {"terminal"}
+    assert oneshot_footprint.oneshot_skills_guidance() == oneshot_footprint.ONESHOT_SKILLS_LOAD_GUIDANCE
     _cfg(monkeypatch, oneshot_learning=True)
-    assert names() == {"skill_manage", "terminal"}
     assert "skill_manage(action='patch')" in oneshot_footprint.oneshot_skills_guidance()
 
 
 def test_interactive_sessions_are_untouched(interactive, monkeypatch):
     _cfg(monkeypatch, oneshot_learning=True)
     assert oneshot_footprint.oneshot_skills_guidance() == ""
-    assert len(oneshot_footprint.prune_oneshot_tools(_tools("skill_manage"))) == 1
     assert br.oneshot_memory_review_due(types.SimpleNamespace(_skill_nudge_interval=10), 50) is False
 
 

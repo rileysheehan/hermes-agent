@@ -20,7 +20,7 @@ from gateway import run
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionStore
 from gateway.session_authority import initialize_session_authority
-from gateway.session_contract import Principal
+from gateway.session_contract import SessionActor
 from gateway.session_controls import AuthorityConnection
 from gateway.session_evaluation import policy_for
 from gateway.session_local import create_local_session, stage_local_session
@@ -44,7 +44,7 @@ async def world(tmp_path, monkeypatch):
                              _draining=False, _cached_agent_for=lambda *a, **k: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(Platform.LOCAL)
     owner = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='retry')
-    actor = Principal('human', str(tmp_path), frozenset({
+    actor = SessionActor('human', str(tmp_path), frozenset({
         'session:create', 'session:read', 'session:submit', 'session:control'}), 'wire')
     params = {'request_id': 'stable-request', 'source': 'oneshot',
               'model': 'fixture', 'cwd': str(tmp_path)}

@@ -8,8 +8,9 @@ it (``completion_admission``), results already admitted are left out of a new ba
 outcome, note or turn, covers the whole batch. When that admission comes up for execution with no
 viewer attached (the authority's own subscriber records) the executor records it in the session's
 history, where the next turn sees it, and settles the admission without a model call. Queue order, restart survival and
-exactly-once are the admission contract's. With a viewer attached it runs as the turn it always was;
-messaging, cron, Kanban, ``/loop`` and heartbeat wakes never reach here.
+exactly-once are the admission contract's. With a viewer attached it runs as the turn it always was,
+except a local cron result, which is always a note; messaging, Kanban, ``/loop`` and heartbeat wakes
+never reach here.
 """
 import json
 import logging
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 # ``_completion_delivery_identity`` kinds: an async delegation's result, a background process's exit
 # and its watch-pattern notices.
 _NOTED_PRODUCERS = frozenset({'async_delegation', 'completion', 'watch_match', 'watch_disabled'})
+# A cron result for a local chat (``session_cron.deliver_to_local_chat``) is finished text: a note
+# with or without a viewer, since a turn over it would only spend a model call (#143547 CRON-11).
+_ALWAYS_NOTED = frozenset({'cron'})
 
 
 def _producer(identity):
@@ -47,7 +51,7 @@ def noted_completion(row, authority=None):
     descriptor = (row or {}).get('payload', {}).get('local_automation_v1')
     if descriptor is None:
         return False
-    if _producer(descriptor['identity']) in _NOTED_PRODUCERS:
+    if _producer(descriptor['identity']) in _NOTED_PRODUCERS | _ALWAYS_NOTED:
         return True
     return authority is not None and _process_tick(row) and follows_finite_turn(authority, row)
 
@@ -67,6 +71,19 @@ _PRIOR_CLIENT_TURN = (
     "AND a.outcome IN ('completed','interrupted','failed') AND NOT EXISTS (SELECT 1 FROM session_admissions b "
     "WHERE b.target_session_id=a.target_session_id AND b.generation=a.generation AND b.seq<a.seq) "
     "ORDER BY a.seq DESC LIMIT 1")
+
+
+async def reopen_for_turn(authority, ref):
+    """A turn (never a note) makes *ref*'s finalized row live again: a local session's receipt tip, or
+    the row of a conversation its chat moved past (gateway/session_detached.py), which the chat's /new
+    ended."""
+    from gateway.session_runtime_workers import tracked_write
+    live = authority.sessions.get(ref.session_id)
+    if live is not None and live.detached:
+        from gateway.session_api import reopen_api_session as reopen
+    else:
+        from gateway.session_local_recovery import reopen_local_session as reopen
+    await tracked_write(authority, partial(reopen, authority, ref))
 
 
 def follows_finite_turn(authority, row):
@@ -120,13 +137,13 @@ async def note_if_unviewed(authority, ref, row):
                     row['admission_id'], ref.session_id)
         authority.pending_results[row['admission_id']] = {'result': {'final_response': '', 'messages': []}, 'usage': {}}
         return ''
-    if live is None or (live.subscribers and not after_finite):
+    descriptor = row['payload']['local_automation_v1']
+    if live is None or (live.subscribers and not after_finite
+                        and _producer(descriptor['identity']) not in _ALWAYS_NOTED):
         # The claim left a closed row closed for a note; the turn reopens it as any first turn does.
-        from gateway.session_local_recovery import reopen_local_session
-        await tracked_write(authority, partial(reopen_local_session, authority, ref))
+        await reopen_for_turn(authority, ref)
         return None
     from gateway.session_viewer_close import _physical_target
-    descriptor = row['payload']['local_automation_v1']
     metadata = {'completion_note': sorted(set(descriptor.get('identities') or ()) | {descriptor['identity']})}
     metadata.update({key: descriptor[key] for key in ('display_text', 'notification_category') if key in descriptor})
     target = _physical_target(authority, ref.session_id)

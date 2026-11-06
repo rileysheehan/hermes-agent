@@ -11,7 +11,7 @@ import pytest
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
 from gateway.session_authority import SessionAuthority, initialize_session_authority
-from gateway.session_contract import Principal
+from gateway.session_contract import SessionActor
 from hermes_state_runtime import list_session_admissions
 
 
@@ -31,7 +31,7 @@ async def _authority(tmp_path, monkeypatch, db=None, instance='watch-fixture'):
 async def _local_session(tmp_path, monkeypatch, request_id='board'):
     from gateway.session_local import create_local_session
     runner, authority = await _authority(tmp_path, monkeypatch)
-    actor = Principal('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}),
+    actor = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}),
                       'fixture')
     ref = create_local_session(authority, actor, dict(request_id=request_id, source='cli', model='fixture',
                                                       toolsets=[]))
