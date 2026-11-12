@@ -43,6 +43,18 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
+def platform_receives_inbound(config: Any) -> bool:
+    """False when the platform block sets ``receive: false`` (``extra.receive``).
+
+    The home still SENDS on the platform -- ``send_message``, ``hermes send``, cron delivery and
+    notices resolve it as configured, through the standalone sender -- but the gateway starts no
+    adapter (no polling, no webhook, no command menu) for it, because another service owns its
+    inbound updates (for example a Telegram bot whose webhook belongs to Paperclip). Setting
+    ``enabled: false`` instead would also switch every send off. Default True: today's behaviour.
+    """
+    return _coerce_bool((getattr(config, "extra", None) or {}).get("receive"), True)
+
+
 def _env_multiplex_profiles_override() -> bool | None:
     """GATEWAY_MULTIPLEX_PROFILES operator override: True/False for a recognized token.
 

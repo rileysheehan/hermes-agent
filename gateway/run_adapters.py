@@ -24,6 +24,7 @@ from gateway.config import (
     SHARED_LISTENER_MIRROR_PLATFORMS,
     Platform,
     platform_binds_port as _platform_binds_port,
+    platform_receives_inbound,
 )
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
@@ -810,6 +811,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         if not _platform_has_bot_credential(platform, platform_config):
             self._drop_from_reconnect_queue(platform, "no bot credential on queued config")
             return
+        if not platform_receives_inbound(platform_config):
+            self._drop_from_reconnect_queue(platform, "receive is false on queued config (send-only)")
+            return
         logger.info("Reconnecting %s (attempt %d)...", platform.value, attempt)
         adapter = None
         try:
@@ -1258,6 +1262,18 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
+                continue
+            if not platform_receives_inbound(platform_config):
+                if platform in profile_map:
+                    # Restart-only contract: like ``enabled: false``, a hot rescan never tears down a live
+                    # receiver. Say so, so nobody hands the bot's inbound to another service on a rescan alone.
+                    logger.warning("[MULTIPLEX] Profile '%s': %s receive is false but its adapter is still "
+                                   "running; a rescan does not stop a receiver -- restart the profile "
+                                   "(hermes -p %s gateway restart) before another service takes its updates",
+                                   profile_name, platform.value, profile_name)
+                else:
+                    logger.info("[MULTIPLEX] Profile '%s': not starting the %s adapter: receive is false "
+                                "(send-only; another service receives its updates)", profile_name, platform.value)
                 continue
             # Runtime re-scan of a served profile (config/.env changed): only platforms that are not
             # already live or queued for reconnect are built — never a second poller on the same bot.

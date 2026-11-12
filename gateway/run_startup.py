@@ -1075,8 +1075,11 @@ class GatewayStartupMixin:
         # An API-server/webhook/local-only gateway has no messaging sender to gate, so the
         # reminder would be unactionable monitoring noise (#115439).
         non_messaging = {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}
+        from gateway.config import platform_receives_inbound
+        # A send-only platform (receive: false) admits no inbound senders here, so it needs no allowlist.
         has_messaging = any(
-            cfg.enabled and platform not in non_messaging for platform, cfg in self.config.platforms.items()
+            cfg.enabled and platform_receives_inbound(cfg) and platform not in non_messaging
+            for platform, cfg in self.config.platforms.items()
         )
         if has_messaging and not any(os.getenv(v) for v in allowed_vars) and not any(
             os.getenv(v, "").lower() in {"true", "1", "yes"} for v in allow_all_vars
@@ -1262,6 +1265,7 @@ class GatewayStartupMixin:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
+        from gateway.config import platform_receives_inbound
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
@@ -1270,6 +1274,10 @@ class GatewayStartupMixin:
             if await self._abort_startup_if_shutdown_requested():
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
+                continue
+            if not platform_receives_inbound(platform_config):
+                logger.info("Not starting the %s adapter: platforms.%s.receive is false (send-only; "
+                            "another service receives its updates)", platform.value, platform.value)
                 continue
             # Multiplex: a platform enabled in the shared config.yaml may hold its token only in a
             # secondary profile's .env; an empty primary would queue a reconnect loop that never heals.

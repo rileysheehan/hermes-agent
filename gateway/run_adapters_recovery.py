@@ -17,7 +17,7 @@ import logging
 import time
 from typing import Optional
 
-from gateway.config import Platform
+from gateway.config import Platform, platform_receives_inbound
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
 from gateway.restart import is_global_startup_conflict
@@ -184,6 +184,10 @@ class GatewaySecondaryReconnectMixin:
             if profile_config is None or not profile_config.enabled:
                 if predecessor is None:
                     self._stand_down_unbuilt_secondary(profile_name, platform, "disabled in config")
+                return None, None
+            if not platform_receives_inbound(profile_config):
+                if predecessor is None:
+                    self._stand_down_unbuilt_secondary(profile_name, platform, "receive is false in config")
                 return None, None
             # Startup credential gate mirror: a removed credential must not rebuild.
             # Mirrors the startup credential gate (#84079): a credential removed from this profile's scope

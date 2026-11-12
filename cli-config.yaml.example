@@ -1518,6 +1518,11 @@ platform_toolsets:
 #     # Default false; ordinary messages, replies, and regex wake words stay blocked.
 #     guest_mode: false
 #     # allowed_chats: ["-1001234567890"]
+#     # receive: false -- send-only: messages, cron delivery and notices still go out on this
+#     # bot, but the gateway starts no adapter (no polling/webhook) because another service owns
+#     # its inbound updates. Default true. (`enabled: false` would switch sending off too.)
+#     # Takes effect when the profile is served: restart it (`hermes -p <name> gateway restart`);
+#     # a hot rescan leaves an already-running receiver in place and logs a warning.
 #     extra:
 #       drop_pending_on_cold_boot: true # Drop Telegram's queued updates on a cold boot (default). Set false on hosts that power off, so messages sent while offline are delivered on the next start; watcher reconnects always preserve them
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
