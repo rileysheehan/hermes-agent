@@ -37,6 +37,81 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+# MER-2063: a Paperclip Agent Chat turn is a finite one-shot client (``hermes chat -q … -Q``) the gateway serves as a
+# local viewer. Its post-turn learning summary ("💾 Memory updated") finishes after the answer, when the quiet client
+# has gone, so it reached no one. Paperclip takes ONE post-answer notice from the turn that answered and shows it in
+# the conversation and in the chat that turn came from (none for a web turn), so the summary goes there.
+_NOTICE_RETRY_S = 5.0
+_NOTICE_BUDGET_S = 300.0
+_NOTICE_MAX_CHARS = 2000
+
+
+def _conversation_notice_target():
+    """Where this turn's notice goes, read in the turn's own context (the review reports from its own thread, which
+    has no forwarded client env); None unless it is a Paperclip Agent Chat turn with its run identity."""
+    from urllib.parse import quote
+
+    from gateway.session_context import get_session_env
+    if get_session_env("PAPERCLIP_CONVERSATION_TURN") != "1":
+        return None
+    api, key, run_id, issue = (get_session_env(name) for name in (
+        "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID"))
+    if not (api and key and run_id and issue):
+        return None
+    base = api.rstrip("/")
+    if not base.endswith("/api"):
+        base += "/api"
+    return {"url": f"{base}/issues/{quote(issue, safe='')}/comments", "key": key, "run_id": run_id}
+
+
+def _post_conversation_notice(target, text, *, opener=None, sleep=time.sleep, clock=time.monotonic):
+    """POST the summary as the turn's conversation notice. Paperclip refuses it until the answer is delivered (409
+    ``conversation_notice_before_answer``), so that and a transport fault are retried within a budget; one already
+    recorded (409 ``conversation_notice_exists``) is success. Never raises; returns True when the notice is recorded."""
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"body": str(text)[:_NOTICE_MAX_CHARS], "conversationNotice": True}).encode()
+    try:
+        request = urllib.request.Request(target["url"], data=body, method="POST", headers={
+            "Authorization": f"Bearer {target['key']}", "X-Paperclip-Run-Id": target["run_id"],
+            "Content-Type": "application/json"})
+    except ValueError:
+        logger.warning("conversation notice not recorded: run=%s (bad Paperclip API URL)", target.get("run_id"))
+        return False
+    deadline = clock() + _NOTICE_BUDGET_S
+    while True:
+        status, raw = None, b""
+        try:
+            with (opener or urllib.request.urlopen)(request, timeout=15) as response:
+                status, raw = response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            with suppress(Exception):
+                raw = exc.read()
+        except Exception as exc:  # a transport fault is retried, never raised into the review
+            raw = str(exc).encode()
+        code = ""
+        with suppress(Exception):
+            code = str((json.loads(raw or b"{}").get("details") or {}).get("code") or "")
+        if status == 201 or (status == 409 and code == "conversation_notice_exists"):
+            logger.info("conversation notice recorded: run=%s status=%s", target["run_id"], status)
+            return True
+        retry = status is None or status >= 500 or (status == 409 and code == "conversation_notice_before_answer")
+        if not retry or clock() >= deadline:
+            logger.warning("conversation notice not recorded: run=%s status=%s code=%s",
+                           target["run_id"], status, code or "-")
+            return False
+        sleep(_NOTICE_RETRY_S)
+
+
+def _send_conversation_notice(target, text):
+    thread = threading.Thread(target=_post_conversation_notice, args=(target, text),
+                              name="conversation-notice", daemon=True)
+    thread.start()
+    return thread
+
 # Consecutive turns a session's persisted transcript may lag its live cached history before
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
@@ -390,6 +465,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
         owner = self._approval_owner
         local_viewer = owner is not None and getattr(ctx.source, "platform", None) == Platform.LOCAL
+        notice_target = _conversation_notice_target() if local_viewer else None
 
         def deliver(message: str) -> None:
             if local_viewer and owner is not None:
@@ -400,6 +476,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 live = authority.sessions.get(session_id)
                 if live is not None:
                     live.event_stream.publish(session_id, {"text": str(message)}, event_type="review.summary")
+                if notice_target is not None:
+                    # A Paperclip Agent Chat turn: its quiet client drops the frame (MER-2063).
+                    _send_conversation_notice(notice_target, message)
                 return
             if self._status_live():
                 self._send_status_text(
