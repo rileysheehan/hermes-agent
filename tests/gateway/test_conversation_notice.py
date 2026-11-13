@@ -113,10 +113,23 @@ def test_a_bad_url_is_reported_not_raised():
                                          opener=_Opener([])) is False
 
 
-def test_long_text_is_capped():
+def _utf16_len(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+@pytest.mark.parametrize("text", ["x" * 5000, "💾" + "x" * 3000, "💾" * 1500, "x" * 1999 + "💾💾", "💾 short"])
+def test_long_text_is_capped_to_the_routes_utf16_length(text):
+    """MER-2350: Paperclip measures JavaScript (UTF-16) length; one emoji made 2000 code points 2001 units."""
     opener = _Opener([_Response(201)])
-    rtr._post_conversation_notice({"url": "http://x/api/issues/i/comments", "key": "k", "run_id": "r"}, "x" * 5000, opener=opener)
-    assert len(json.loads(opener.requests[0].data)["body"]) == rtr._NOTICE_MAX_CHARS
+    rtr._post_conversation_notice({"url": "http://x/api/issues/i/comments", "key": "k", "run_id": "r"}, text,
+                                  opener=opener)
+    sent = json.loads(opener.requests[0].data)["body"]
+    assert _utf16_len(sent) <= rtr._NOTICE_MAX_CHARS
+    assert text.startswith(sent) and "\ufffd" not in sent           # a prefix, never a split surrogate
+    if _utf16_len(text) <= rtr._NOTICE_MAX_CHARS:
+        assert sent == text
+    else:
+        assert _utf16_len(sent) >= rtr._NOTICE_MAX_CHARS - 1          # filled to the boundary
 
 
 def _runner(platform):

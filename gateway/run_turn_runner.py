@@ -65,6 +65,15 @@ def _conversation_notice_target():
     return {"url": f"{base}/issues/{quote(issue, safe='')}/comments", "key": key, "run_id": run_id}
 
 
+def _cap_utf16(text, limit=_NOTICE_MAX_CHARS):
+    """Cap ``text`` at ``limit`` UTF-16 code units, the measure Paperclip's route applies (JavaScript string length;
+    MER-2350: an emoji counts 2 there, 1 here), without splitting a surrogate pair."""
+    units = text.encode("utf-16-le")
+    if len(units) <= limit * 2:
+        return text
+    return units[:limit * 2].decode("utf-16-le", errors="ignore")
+
+
 def _post_conversation_notice(target, text, *, opener=None, sleep=time.sleep, clock=time.monotonic):
     """POST the summary as the turn's conversation notice. Paperclip refuses it until the answer is delivered (409
     ``conversation_notice_before_answer``), so that and a transport fault are retried within a budget; one already
@@ -72,7 +81,7 @@ def _post_conversation_notice(target, text, *, opener=None, sleep=time.sleep, cl
     import urllib.error
     import urllib.request
 
-    body = json.dumps({"body": str(text)[:_NOTICE_MAX_CHARS], "conversationNotice": True}).encode()
+    body = json.dumps({"body": _cap_utf16(str(text)), "conversationNotice": True}).encode()
     try:
         request = urllib.request.Request(target["url"], data=body, method="POST", headers={
             "Authorization": f"Bearer {target['key']}", "X-Paperclip-Run-Id": target["run_id"],
