@@ -45,6 +45,11 @@ def gateway_ws_target(endpoint, ticket):
     return url, [GATEWAY_WS_PROTOCOL, GATEWAY_WS_TICKET_PREFIX + ticket]
 
 
+# A local owner's socket needs no keepalive (connect_gateway); any other peer keeps the websockets default.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_PING_INTERVAL_S = 20.0
+
+
 class GatewayClientError(ValueError):
     pass
 
@@ -377,12 +382,19 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
             raise GatewayUnavailableError(f"Gateway inaccessible: {exc.reason}" + (f" ({detail})" if detail else ""),
                                           "inaccessible", exc.reason) from exc
         url, protocols = gateway_ws_target(endpoint, ticket)
+    # A discovered owner on this machine is a loopback peer: no client keepalive, as the owner's own
+    # listener already does (build_listener_server). The ping is answered on the owner's agent event
+    # loop, which a GIL-holding turn can starve past the 20 s default; the client then closes a healthy
+    # socket with 1011, and a finite turn's owner stops that turn as if its submitter had gone. A dead
+    # process on either end still closes the socket with a real FIN/RST. An explicit URL may be a
+    # tunnel that only a ping can find half-open, so it keeps the library's keepalive.
+    ping_interval = None if not remote and urlsplit(url).hostname in _LOOPBACK_HOSTS else _PING_INTERVAL_S
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=max_size,
-                           proxy=None) as ws:
+                           proxy=None, ping_interval=ping_interval) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:
