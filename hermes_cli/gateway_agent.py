@@ -560,7 +560,7 @@ class GatewayAgent:
         first turn publishes, without a round trip."""
         self._reset_session_figures()
         state = self._state()
-        if not (state.messages or state.usage):
+        if not (state.messages or state.message_count or state.usage):
             return
         if not self._refresh_stats() and state.usage:
             self.apply_session_usage(state.usage)
