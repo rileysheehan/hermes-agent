@@ -58,6 +58,13 @@ def _zero(*_a, **_k):
     return 0
 
 
+def _finite_cli():
+    """A ``-q``/``-Q`` run (``HERMES_SINGLE_QUERY_SESSION``, as ``session_source_for`` reads it): it restores its
+    history from the local SessionDB, so its resumes need no transcript from the owner."""
+    from gateway.session_context import get_session_env
+    return get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1"
+
+
 class GatewaySessionStore:
     """Truthy until the viewer's gateway connection is final (main's ``if self._session_db:`` guards);
     a gateway hang-up stays truthy, and the next call redials."""
@@ -143,6 +150,7 @@ class GatewaySessionStore:
         """Create (or resume) the gateway session for this CLI and adopt its id. A resume target the
         gateway does not know is left as is: main's own "Session not found" path reports it."""
         key = self.connection.launch_api_key = (launch or {}).get("api_key") or None
+        self.connection.omit_resume_messages = _finite_cli()
         self.connection.launch_api_key_typed = key is not None and key == getattr(cli, "_typed_api_key", None)
         if getattr(cli, "_resumed", False):
             try:

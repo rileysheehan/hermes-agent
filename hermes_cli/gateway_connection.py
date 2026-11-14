@@ -70,6 +70,7 @@ class SessionState:
         self.subscription_id = None
         self.execution_generation = None
         self.messages: list = []
+        self.message_count = 0  # the owner's stored size, also when a resume omitted the transcript
         self.usage: dict = {}
         # Called (loop thread) with each ``session.usage`` payload; GatewayAgent maps it onto main's
         # agent attributes, so a frame landing between turns is never dropped with the turn queue.
@@ -106,7 +107,13 @@ class SessionState:
         self.revision = snapshot.get("revision", self.revision)
         self.subscription_id = snapshot.get("subscription_id", self.subscription_id)
         self.execution_generation = snapshot.get("execution_generation", self.execution_generation)
-        self.messages = list(snapshot.get("messages") or [])
+        if snapshot.get("messages_omitted"):
+            # A finite run's resume asks for no transcript (``GatewayConnection.omit_resume_messages``):
+            # keep whatever this viewer already held instead of reading the omission as an empty chat.
+            self.message_count = int(snapshot.get("message_count") or 0)
+        else:
+            self.messages = list(snapshot.get("messages") or [])
+            self.message_count = int(snapshot.get("message_count") or len(self.messages))
         if "todo_state" in snapshot:  # null clears an earlier plan; a missing key (older gateway) keeps it
             todo_state = snapshot["todo_state"]
             self.todo_state = dict(todo_state) if isinstance(todo_state, dict) else None
@@ -306,28 +313,37 @@ class GatewayConnection:
                 logger.debug("session.resume %s after reconnect: %s", session_id, exc)
                 state.subscription_id = None
 
+    #: A finite (``-q``/``-Q``) CLI restores its history from the local SessionDB and never shows the
+    #: snapshot's transcript, so its resumes ask the owner to omit it (``session.resume omit_messages``).
+    #: The whole transcript in one frame can exceed the client's 8 MiB ``max_size`` (close 1009), after
+    #: which that session can never start again. Interactive viewers keep the full snapshot.
+    omit_resume_messages = False
+
+    def _resume_params(self):
+        return {"omit_messages": True} if self.omit_resume_messages else {}
+
     def resume(self, call, session_id, *, typed=False):
         """``session.resume`` through ``call`` (the store's attach), re-supplying :attr:`launch_api_key`;
         a refusal of the keyed resume is :func:`_resume_plain`'s to decide. ``typed``: the user resumes with
         a typed ``--api-key``."""
-        key = self.launch_api_key
+        key, extra = self.launch_api_key, self._resume_params()
         if key:
             try:
-                return call("session.resume", session_id=session_id, api_key=key)
+                return call("session.resume", session_id=session_id, api_key=key, **extra)
             except GatewayRPCError as exc:
                 _resume_plain(exc, session_id, typed)
-        return call("session.resume", session_id=session_id)
+        return call("session.resume", session_id=session_id, **extra)
 
     async def _resume(self, client, session_id):
         """:meth:`resume` for :meth:`_resubscribe`, awaited on this loop so a cancelled reconnect cancels
         its request. A reconnect types nothing: never ``typed``."""
-        key = self.launch_api_key
+        key, extra = self.launch_api_key, self._resume_params()
         if key:
             try:
-                return await client.rpc("session.resume", session_id=session_id, api_key=key)
+                return await client.rpc("session.resume", session_id=session_id, api_key=key, **extra)
             except GatewayRPCError as exc:
                 _resume_plain(exc, session_id, typed=False)
-        return await client.rpc("session.resume", session_id=session_id)
+        return await client.rpc("session.resume", session_id=session_id, **extra)
 
     async def _pump(self, client):
         while True:
@@ -401,7 +417,7 @@ class GatewayConnection:
         """``session.resume`` after a replay gap; its snapshot names the subscription to detach."""
         state = self.state(session_id)
         gaps = state.gaps
-        snapshot = self.call("session.resume", session_id=session_id, abandon=abandon)
+        snapshot = self.call("session.resume", session_id=session_id, abandon=abandon, **self._resume_params())
         state.adopt_snapshot(snapshot)
         state.attached_gaps = gaps  # a gap during this resume (or a wait given up) still owes one
         return snapshot
